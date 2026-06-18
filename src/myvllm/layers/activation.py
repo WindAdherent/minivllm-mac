@@ -14,7 +14,9 @@ class SiluAndMul(nn.Module):
 
     @torch.compile
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 将输入张量在最后一个维度上分成两部分
         x, y = x.chunk(2, -1)
+        # 门控激活：前一半应用SiLU激活函数，后一半保持不变，然后进行元素级乘法
         return F.silu(x) * y
 
 if __name__ == "__main__":
