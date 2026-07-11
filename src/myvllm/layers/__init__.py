@@ -1,5 +1,5 @@
 from .activation import SiluAndMul
-# from .attention import Attention
+from .attention import Attention
 from .embedding_head import ParallelLMHead, VocabParallelEmbedding
 from .layernorm import LayerNorm
 from .linear import *
