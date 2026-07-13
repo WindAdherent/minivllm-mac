@@ -23,7 +23,7 @@
 - Create: `tests/test_attention.py`
 - Test: `tests/test_attention.py`
 
-- [ ] **Step 1: Write the failing import and behavior tests**
+- [x] **Step 1: Write the failing import and behavior tests**
 
 Create a test module that loads `attention.py` directly with a stubbed `myvllm.utils`, defines an explicit GQA reference, and includes these tests:
 
@@ -187,7 +187,7 @@ def test_mps_cache_and_prefill_preserve_device_and_values():
     torch.testing.assert_close(output.cpu(), expected, rtol=1e-5, atol=1e-5)
 ```
 
-- [ ] **Step 2: Run the import test to verify RED**
+- [x] **Step 2: Run the import test to verify RED**
 
 Run:
 
@@ -197,7 +197,7 @@ uv run --no-sync pytest tests/test_attention.py::test_attention_module_imports_w
 
 Expected: FAIL while importing `triton`, demonstrating the Mac-incompatible dependency.
 
-- [ ] **Step 3: Keep the tests uncommitted until the first implementation turns them green**
+- [x] **Step 3: Keep the tests uncommitted until the first implementation turns them green**
 
 Confirm `git status --short` shows the new test file and the user's existing `attention.py` modification, with no unrelated files staged.
 
@@ -207,7 +207,7 @@ Confirm `git status --short` shows the new test file and the user's existing `at
 - Modify: `src/myvllm/layers/attention.py`
 - Test: `tests/test_attention.py`
 
-- [ ] **Step 1: Replace Triton imports/kernels with Torch/MLX helpers**
+- [x] **Step 1: Replace Triton imports/kernels with Torch/MLX helpers**
 
 Use these private adapters at the top of `attention.py`:
 
@@ -240,7 +240,7 @@ def _copy_mlx_to_torch(array: mx.array, destination: torch.Tensor) -> None:
         destination.copy_(result)
 ```
 
-- [ ] **Step 2: Implement MLX indexed cache updates**
+- [x] **Step 2: Implement MLX indexed cache updates**
 
 Retain the public signature and assertions. Filter ignored slots with Torch because MLX 0.32 does not support boolean advanced indices, then do block arithmetic and indexed assignment in MLX:
 
@@ -262,7 +262,7 @@ _copy_mlx_to_torch(k_cache_mx, k_cache)
 _copy_mlx_to_torch(v_cache_mx, v_cache)
 ```
 
-- [ ] **Step 3: Run import and cache tests to verify GREEN**
+- [x] **Step 3: Run import and cache tests to verify GREEN**
 
 Run:
 
@@ -272,7 +272,7 @@ uv run --no-sync pytest tests/test_attention.py -k "imports_without_triton or st
 
 Expected: 2 passed.
 
-- [ ] **Step 4: Commit the first green slice**
+- [x] **Step 4: Commit the first green slice**
 
 ```bash
 git add tests/test_attention.py src/myvllm/layers/attention.py

@@ -1,74 +1,38 @@
-import triton 
-import triton.language as tl
-from myvllm.utils import get_context
+from __future__ import annotations
+
+import mlx.core as mx
 import torch
 import torch.nn as nn
 
-@triton.jit
-def store_kvcache_kernel(
-    key_ptr, # pointer to what we want to store
-    value_ptr,
-    k_cache_ptr, # pointer to where we want to store
-    v_cache_ptr,
-    slot_mapping_ptr,
-    num_kv_heads: tl.constexpr,
-    head_dim: tl.constexpr,
-    block_size: tl.constexpr
-):
-    """
-    Store keys and values into paged KV cache.
-    Each token is mapped to a slot via slot_mapping.
-    Grid layout: (num_tokens, num_kv_heads)
-    Cache layout: (num_blocks, block_size, num_kv_heads, head_dim)
-    """
-    # thread ID, in dimension 0
-    token_idx = tl.program_id(0) # each GPU thread processes one token
-    # slot ID, where in cache to store this token
-    slot_idx = tl.load(slot_mapping_ptr + token_idx)
-    
-    if slot_idx == -1:
-        return
-    
-    # Calculate which block and position within block
-    block_idx = slot_idx // block_size
-    block_offset = slot_idx % block_size
-    
-    # Process each head
-    # program_id(0) = which token
-    # program_id(1) = which head
-    head_idx = tl.program_id(1)
-    
-    # it creates a vector [0, 1, ..., head_dim-1]
-    # Load key and value for this token and head
-    head_offsets = tl.arange(0, head_dim)
-    # Input: (num_tokens, num_kv_heads, head_dim)
-    # example: input_offset = 5 * (8 * 128) + 3 * 128 + [0, 1, 2, ..., 127]
-    #         = 5120 + 384 + [0, 1, 2, ..., 127]
-    #         = [5504, 5505, 5506, ..., 5631]
-    input_offset = (token_idx * num_kv_heads * head_dim + # skip previous tokens
-                    head_idx * head_dim + # skip previous heads
-                    head_offsets)
+from myvllm.utils import get_context
 
-    # Cache: (num_blocks, block_size, num_kv_heads, head_dim)
-    cache_offset = (block_idx * block_size * num_kv_heads * head_dim + # skip previous blocks
-                   block_offset * num_kv_heads * head_dim + # skip previous positions in block
-                   head_idx * head_dim + # skip previous heads
-                   head_offsets) 
-    
-    # load key and value value floats from the pointers's memory
-    key = tl.load(key_ptr + input_offset)
-    value = tl.load(value_ptr + input_offset)
-    
-    # store into cache
-    tl.store(k_cache_ptr + cache_offset, key)
-    tl.store(v_cache_ptr + cache_offset, value)
+
+def _torch_to_mlx(tensor: torch.Tensor) -> mx.array:
+    tensor = tensor.detach().contiguous()
+    if tensor.device.type == "mps":
+        torch.mps.synchronize()
+    return mx.from_dlpack(tensor)
+
+
+def _mlx_to_torch(array: mx.array, like: torch.Tensor) -> torch.Tensor:
+    mx.eval(array)
+    result = torch.from_dlpack(array)
+    if result.device != like.device or result.dtype != like.dtype:
+        result = result.to(device=like.device, dtype=like.dtype)
+    return result
+
+
+def _copy_mlx_to_torch(array: mx.array, destination: torch.Tensor) -> None:
+    result = _mlx_to_torch(array, destination)
+    if result.data_ptr() != destination.data_ptr():
+        destination.copy_(result)
 
 
 def store_kvcache(
-    key: torch.Tensor, 
-    value: torch.Tensor, 
-    k_cache: torch.Tensor, 
-    v_cache: torch.Tensor, 
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     block_size: int
 ):
@@ -83,130 +47,26 @@ def store_kvcache(
         slot_mapping: (num_tokens,) - maps each token to a cache slot
         block_size: number of tokens per block
     """
-    num_tokens, num_kv_heads, head_dim = key.shape
-    
-    # Make contiguous if needed
-    if not key.is_contiguous():
-        key = key.contiguous()
-    if not value.is_contiguous():
-        value = value.contiguous()
-    
+    num_tokens = key.shape[0]
+
     assert k_cache.shape == v_cache.shape, "K and V cache shapes must match"
     assert slot_mapping.numel() == num_tokens, "Slot mapping size must match number of tokens"
-    
-    grid = (num_tokens, num_kv_heads)
-    # launch num_tokens x num_kv_heads threads
-    store_kvcache_kernel[grid](
-        key, # tensors are automatically converted to pointers by triton
-        value,
-        k_cache,
-        v_cache,
-        slot_mapping,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        block_size=block_size
-    )
 
-
-@triton.jit
-def flash_attention_varlen_kernel(
-    Q, K, V, O,
-    cu_seqlens_q_ptr,
-    scale,
-    num_heads: tl.constexpr,
-    num_kv_heads: tl.constexpr,
-    head_dim: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    """
-    Flash Attention kernel for variable-length sequences.
-    Each program processes one block of queries for one head in one sequence.
-    """
-    # Program IDs
-    start_m = tl.program_id(0) # block index
-    off_h = tl.program_id(1) # head index
-    seq_idx = tl.program_id(2) # sequence index
-
-    # Determine which KV head to use (for GQA)
-    kv_head_idx = off_h // (num_heads // num_kv_heads)
-    
-    # Load sequence boundaries
-    seq_start = tl.load(cu_seqlens_q_ptr + seq_idx)
-    seq_end = tl.load(cu_seqlens_q_ptr + seq_idx + 1)
-    seq_len = seq_end - seq_start
-    
-    # Early exit if this block is beyond sequence length
-    if start_m * BLOCK_M >= seq_len:
+    valid = slot_mapping != -1
+    if not bool(valid.any().item()):
         return
-    
-    # Offset for this block of queries
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, head_dim)
-    
-    # Query pointers: Q has shape (total_tokens, num_heads, head_dim)
-    q_ptrs = Q + (seq_start + offs_m[:, None]) * num_heads * head_dim + off_h * head_dim + offs_d[None, :]
-    
-    # Load Q block - shape (BLOCK_M, head_dim)
-    mask_m = offs_m < seq_len
-    q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
-    
-    # Initialize output accumulators
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - 1e10
-    acc = tl.zeros([BLOCK_M, head_dim], dtype=tl.float32)
-    
-    # Number of blocks to process
-    num_blocks = tl.cdiv(seq_len, BLOCK_N)
-    
-    # Loop over K, V blocks
-    for block_n in range(num_blocks):
-        start_n = block_n * BLOCK_N
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        
-        # Mask for valid positions
-        mask_n = offs_n < seq_len
-        
-        # K pointers: K has shape (total_tokens, num_kv_heads, head_dim)
-        k_ptrs = K + (seq_start + offs_n[None, :]) * num_kv_heads * head_dim + kv_head_idx * head_dim + offs_d[:, None]
-        
-        # Load K block - shape (head_dim, BLOCK_N)
-        k = tl.load(k_ptrs, mask=mask_n[None, :], other=0.0)
-        
-        # Compute QK^T - shape (BLOCK_M, BLOCK_N)
-        qk = tl.dot(q, k)
-        qk = qk * scale
-        
-        # Apply causal mask: only attend to positions <= current position
-        mask_causal = (offs_m[:, None] + seq_start) >= (offs_n[None, :] + seq_start)
-        qk = tl.where(mask_causal & mask_n[None, :], qk, -1e10)
-        
-        # Online softmax update
-        m_ij = tl.max(qk, axis=1)
-        m_i_new = tl.maximum(m_i, m_ij)
-        alpha = tl.exp(m_i - m_i_new)
-        p = tl.exp(qk - m_i_new[:, None])
-        
-        # Rescale previous accumulator
-        acc = acc * alpha[:, None]
-        
-        # Load V block - shape (BLOCK_N, head_dim)
-        v_ptrs = V + (seq_start + offs_n[:, None]) * num_kv_heads * head_dim + kv_head_idx * head_dim + offs_d[None, :]
-        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
-        
-        # Accumulate weighted values
-        acc = acc + tl.dot(p.to(v.dtype), v)
-        
-        # Update normalizer
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        m_i = m_i_new
-    
-    # Final normalization
-    acc = acc / l_i[:, None]
-    
-    # Store output: O has shape (total_tokens, num_heads, head_dim)
-    o_ptrs = O + (seq_start + offs_m[:, None]) * num_heads * head_dim + off_h * head_dim + offs_d[None, :]
-    tl.store(o_ptrs, acc.to(O.dtype.element_ty), mask=mask_m[:, None])
+
+    valid_slots = slot_mapping[valid].to(dtype=torch.long)
+    slots = _torch_to_mlx(valid_slots).astype(mx.int32)
+    block_indices = slots // block_size
+    block_offsets = slots % block_size
+    k_cache_mx = _torch_to_mlx(k_cache)
+    v_cache_mx = _torch_to_mlx(v_cache)
+    k_cache_mx[block_indices, block_offsets] = _torch_to_mlx(key[valid])
+    v_cache_mx[block_indices, block_offsets] = _torch_to_mlx(value[valid])
+    mx.eval(k_cache_mx, v_cache_mx)
+    _copy_mlx_to_torch(k_cache_mx, k_cache)
+    _copy_mlx_to_torch(v_cache_mx, v_cache)
 
 
 def flash_attention_prefill(
@@ -280,7 +140,6 @@ def flash_attention_prefill(
     return output
 
 
-@triton.jit
 def paged_attention_decode_kernel(
     output_ptr,
     query_ptr,
