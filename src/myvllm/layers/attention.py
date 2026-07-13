@@ -1,18 +1,38 @@
-import mlx.core as mx
+from typing import Any
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from myvllm.utils import get_context
 
 
-def _torch_to_mlx(tensor: torch.Tensor) -> mx.array:
+def _mlx_core() -> Any:
+    import mlx.core as mx
+
+    return mx
+
+
+def _repeat_kv(
+    tensor: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+) -> torch.Tensor:
+    if num_heads == num_kv_heads:
+        return tensor
+    return tensor.repeat_interleave(num_heads // num_kv_heads, dim=1)
+
+
+def _torch_to_mlx(tensor: torch.Tensor) -> Any:
+    mx = _mlx_core()
     tensor = tensor.detach().contiguous()
     if tensor.device.type == "mps":
         torch.mps.synchronize()
     return mx.from_dlpack(tensor)
 
 
-def _mlx_to_torch(array: mx.array, like: torch.Tensor) -> torch.Tensor:
+def _mlx_to_torch(array: Any, like: torch.Tensor) -> torch.Tensor:
+    mx = _mlx_core()
     mx.eval(array)
     result = torch.from_dlpack(array)
     if result.device != like.device or result.dtype != like.dtype:
@@ -20,7 +40,7 @@ def _mlx_to_torch(array: mx.array, like: torch.Tensor) -> torch.Tensor:
     return result
 
 
-def _copy_mlx_to_torch(array: mx.array, destination: torch.Tensor) -> None:
+def _copy_mlx_to_torch(array: Any, destination: torch.Tensor) -> None:
     result = _mlx_to_torch(array, destination)
     if result.data_ptr() != destination.data_ptr():
         destination.copy_(result)
@@ -41,10 +61,25 @@ def store_kvcache(
         "Slot mapping size must match number of tokens"
     )
 
+    if k_cache.device.type != "mps":
+        slot_mapping = slot_mapping.to(
+            device=k_cache.device, dtype=torch.long
+        )
+        valid = slot_mapping != -1
+        slots = slot_mapping[valid]
+        block_indices = torch.div(
+            slots, block_size, rounding_mode="floor"
+        )
+        block_offsets = torch.remainder(slots, block_size)
+        k_cache[block_indices, block_offsets] = key[valid]
+        v_cache[block_indices, block_offsets] = value[valid]
+        return
+
     valid = slot_mapping != -1
     if not bool(valid.any().item()):
         return
 
+    mx = _mlx_core()
     valid_slots = slot_mapping[valid].to(dtype=torch.long)
     slots = _torch_to_mlx(valid_slots).astype(mx.int32)
     block_indices = slots // block_size
@@ -69,6 +104,31 @@ def flash_attention_prefill(
     head_dim: int,
 ) -> torch.Tensor:
     """Compute packed variable-length causal attention with native MLX."""
+    if q.device.type != "mps":
+        output = torch.empty_like(q)
+        boundaries = cu_seqlens.detach().to(
+            device="cpu", dtype=torch.long
+        ).tolist()
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            if start == end:
+                continue
+            query = q[start:end].transpose(0, 1).unsqueeze(0)
+            key = k[start:end].transpose(0, 1).unsqueeze(0)
+            value = v[start:end].transpose(0, 1).unsqueeze(0)
+            key = _repeat_kv(key, num_heads, num_kv_heads)
+            value = _repeat_kv(value, num_heads, num_kv_heads)
+            sequence_output = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                dropout_p=0.0,
+                is_causal=True,
+                scale=scale,
+            )
+            output[start:end] = sequence_output[0].transpose(0, 1)
+        return output
+
+    mx = _mlx_core()
     q_mx = _torch_to_mlx(q)
     k_mx = _torch_to_mlx(k)
     v_mx = _torch_to_mlx(v)
@@ -116,6 +176,50 @@ def paged_attention_decode(
     block_size: int,
 ) -> torch.Tensor:
     """Compute decode attention over a paged KV cache with native MLX."""
+    if query.device.type != "mps":
+        output = torch.empty_like(query)
+        block_tables = block_tables.to(
+            device=k_cache.device, dtype=torch.long
+        )
+        context_lengths = context_lens.detach().to(
+            device="cpu", dtype=torch.long
+        ).tolist()
+        for batch_index, context_len in enumerate(context_lengths):
+            if context_len == 0:
+                output[batch_index].zero_()
+                continue
+            token_indices = torch.arange(
+                context_len, device=block_tables.device
+            )
+            physical_blocks = block_tables[
+                batch_index, token_indices // block_size
+            ]
+            block_offsets = token_indices % block_size
+            valid_blocks = physical_blocks >= 0
+            if not bool(valid_blocks.any().item()):
+                output[batch_index].zero_()
+                continue
+            physical_blocks = physical_blocks[valid_blocks]
+            block_offsets = block_offsets[valid_blocks]
+            key = k_cache[physical_blocks, block_offsets]
+            value = v_cache[physical_blocks, block_offsets]
+            key = key.transpose(0, 1).unsqueeze(0)
+            value = value.transpose(0, 1).unsqueeze(0)
+            key = _repeat_kv(key, num_heads, num_kv_heads)
+            value = _repeat_kv(value, num_heads, num_kv_heads)
+            batch_query = query[batch_index].unsqueeze(0).unsqueeze(2)
+            batch_output = F.scaled_dot_product_attention(
+                batch_query,
+                key,
+                value,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=scale,
+            )
+            output[batch_index] = batch_output[0, :, 0]
+        return output
+
+    mx = _mlx_core()
     query_mx = _torch_to_mlx(query)
     k_cache_mx = _torch_to_mlx(k_cache)
     v_cache_mx = _torch_to_mlx(v_cache)
@@ -140,8 +244,18 @@ def paged_attention_decode(
             batch_index, token_indices // block_size
         ]
         block_offsets = token_indices % block_size
-        key = k_cache_mx[physical_blocks, block_offsets]
-        value = v_cache_mx[physical_blocks, block_offsets]
+        valid_blocks = physical_blocks >= 0
+        if not bool(mx.any(valid_blocks).item()):
+            outputs.append(
+                mx.zeros(
+                    query_mx[batch_index].shape,
+                    dtype=query_mx.dtype,
+                )
+            )
+            continue
+        safe_blocks = mx.where(valid_blocks, physical_blocks, 0)
+        key = k_cache_mx[safe_blocks, block_offsets]
+        value = v_cache_mx[safe_blocks, block_offsets]
         batch_query = mx.expand_dims(
             mx.expand_dims(query_mx[batch_index], axis=0), axis=2
         )
@@ -152,6 +266,7 @@ def paged_attention_decode(
             key,
             value,
             scale=scale,
+            mask=valid_blocks[None, None, None, :],
         )
         outputs.append(batch_output[0, :, 0])
 

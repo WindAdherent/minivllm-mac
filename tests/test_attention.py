@@ -11,9 +11,9 @@ ROOT = Path(__file__).resolve().parents[1]
 ATTENTION_PATH = ROOT / "src" / "myvllm" / "layers" / "attention.py"
 
 
-def load_attention_module():
+def load_attention_module(get_context=lambda: None):
     utils = types.ModuleType("myvllm.utils")
-    utils.get_context = lambda: None
+    utils.get_context = get_context
     spec = importlib.util.spec_from_file_location(
         "attention_under_test", ATTENTION_PATH
     )
@@ -49,14 +49,22 @@ def reference_attention(query, key, value, scale, causal):
     return torch.stack(heads, dim=1)
 
 
+def fail_if_mlx_is_used_for_cpu(_tensor):
+    raise AssertionError("CPU fallback must not initialize MLX/Metal")
+
+
 def test_attention_module_imports_without_triton():
+    mlx_was_loaded = "mlx.core" in sys.modules
     module = load_attention_module()
 
     assert module.Attention is not None
+    if not mlx_was_loaded:
+        assert "mlx.core" not in sys.modules
 
 
 def test_store_kvcache_maps_slots_and_skips_negative_entries():
     module = load_attention_module()
+    module._torch_to_mlx = fail_if_mlx_is_used_for_cpu
     key = torch.arange(24, dtype=torch.float32).reshape(4, 2, 3)
     value = key + 100
     k_cache = torch.full((3, 2, 2, 3), -1.0)
@@ -89,6 +97,7 @@ def test_store_kvcache_maps_slots_and_skips_negative_entries():
 
 def test_flash_attention_prefill_handles_varlen_causal_gqa():
     module = load_attention_module()
+    module._torch_to_mlx = fail_if_mlx_is_used_for_cpu
     torch.manual_seed(7)
     q = torch.randn(5, 4, 3)
     k = torch.randn(5, 2, 3)
@@ -118,6 +127,7 @@ def test_flash_attention_prefill_handles_varlen_causal_gqa():
 
 def test_paged_attention_decode_follows_block_tables_with_gqa_and_empty_context():
     module = load_attention_module()
+    module._torch_to_mlx = fail_if_mlx_is_used_for_cpu
     torch.manual_seed(11)
     query = torch.randn(3, 4, 3)
     k_cache = torch.randn(4, 2, 2, 3)
@@ -167,6 +177,41 @@ def test_paged_attention_decode_follows_block_tables_with_gqa_and_empty_context(
 @pytest.mark.skipif(
     not torch.backends.mps.is_available(), reason="MPS is unavailable"
 )
+def test_paged_attention_decode_skips_unmapped_cache_blocks():
+    module = load_attention_module()
+    torch.manual_seed(13)
+    query_cpu = torch.randn(1, 4, 3)
+    k_cache_cpu = torch.randn(3, 2, 2, 3)
+    v_cache_cpu = torch.randn(3, 2, 2, 3)
+
+    output = module.paged_attention_decode(
+        query_cpu.to("mps"),
+        k_cache_cpu.to("mps"),
+        v_cache_cpu.to("mps"),
+        torch.tensor([[1, -1]], device="mps"),
+        torch.tensor([3], device="mps"),
+        0.31,
+        num_heads=4,
+        num_kv_heads=2,
+        head_dim=3,
+        block_size=2,
+    )
+
+    expected = reference_attention(
+        query_cpu,
+        k_cache_cpu[1],
+        v_cache_cpu[1],
+        0.31,
+        causal=False,
+    )
+    torch.testing.assert_close(
+        output.cpu(), expected, rtol=1e-5, atol=1e-5
+    )
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(), reason="MPS is unavailable"
+)
 def test_mps_cache_and_prefill_preserve_device_and_values():
     module = load_attention_module()
     key_cpu = torch.arange(24, dtype=torch.float32).reshape(4, 2, 3)
@@ -210,11 +255,90 @@ def test_mps_cache_and_prefill_preserve_device_and_values():
     )
 
 
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(), reason="MPS is unavailable"
+)
+def test_attention_forward_runs_mps_prefill_and_decode_end_to_end():
+    current_context = [None]
+    module = load_attention_module(lambda: current_context[0])
+    layer = module.Attention(
+        num_heads=4,
+        head_dim=3,
+        num_kv_heads=2,
+        block_size=2,
+    ).to("mps")
+    layer.k_cache = torch.zeros(3, 2, 2, 3, device="mps")
+    layer.v_cache = torch.zeros_like(layer.k_cache)
+
+    torch.manual_seed(19)
+    q_cpu = torch.randn(4, 4, 3)
+    k_cpu = torch.randn(4, 2, 3)
+    v_cpu = torch.randn(4, 2, 3)
+    current_context[0] = types.SimpleNamespace(
+        is_prefill=True,
+        cu_seqlens_q=torch.tensor([0, 4], device="mps"),
+        slot_mapping=torch.arange(4, device="mps"),
+        context_lens=None,
+        block_tables=None,
+    )
+
+    prefill_output = layer(
+        q_cpu.to("mps"), k_cpu.to("mps"), v_cpu.to("mps")
+    )
+    expected_prefill = reference_attention(
+        q_cpu, k_cpu, v_cpu, 3**-0.5, causal=True
+    ).reshape(4, 12)
+
+    assert prefill_output.shape == (4, 12)
+    assert prefill_output.device.type == "mps"
+    assert prefill_output.dtype == q_cpu.dtype
+    torch.testing.assert_close(
+        prefill_output.cpu(), expected_prefill, rtol=1e-5, atol=1e-5
+    )
+    torch.testing.assert_close(
+        layer.k_cache.flatten(0, 1)[:4].cpu(), k_cpu
+    )
+
+    decode_q_cpu = torch.randn(1, 4, 3)
+    decode_k_cpu = torch.randn(1, 2, 3)
+    decode_v_cpu = torch.randn(1, 2, 3)
+    current_context[0] = types.SimpleNamespace(
+        is_prefill=False,
+        cu_seqlens_q=None,
+        slot_mapping=torch.tensor([4], device="mps"),
+        context_lens=torch.tensor([5], device="mps"),
+        block_tables=torch.tensor([[0, 1, 2]], device="mps"),
+    )
+
+    decode_output = layer(
+        decode_q_cpu.to("mps"),
+        decode_k_cpu.to("mps"),
+        decode_v_cpu.to("mps"),
+    )
+    expected_decode = reference_attention(
+        decode_q_cpu,
+        torch.cat([k_cpu, decode_k_cpu]),
+        torch.cat([v_cpu, decode_v_cpu]),
+        3**-0.5,
+        causal=False,
+    ).reshape(1, 12)
+
+    assert decode_output.shape == (1, 12)
+    assert decode_output.device.type == "mps"
+    assert decode_output.dtype == decode_q_cpu.dtype
+    torch.testing.assert_close(
+        decode_output.cpu(), expected_decode, rtol=1e-5, atol=1e-5
+    )
+    torch.testing.assert_close(layer.k_cache[2, 0].cpu(), decode_k_cpu[0])
+
+
 def test_scoped_sources_have_no_cuda_or_triton_execution():
     paths = sorted((ROOT / "src" / "myvllm" / "layers").glob("*.py"))
-    paths.append(ROOT / "src" / "myvllm" / "models" / "qwen3.py")
+    qwen_path = ROOT / "src" / "myvllm" / "models" / "qwen3.py"
+    paths.append(qwen_path)
     source = "\n".join(path.read_text() for path in paths)
 
     assert "import triton" not in source
     assert ".cuda(" not in source
     assert "torch.cuda." not in source
+    assert "tcp://127.0.0.1:29501" not in qwen_path.read_text()

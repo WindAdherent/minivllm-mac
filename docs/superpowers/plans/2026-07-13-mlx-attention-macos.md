@@ -571,3 +571,30 @@ git status --short
 ```
 
 Expected: no executable Triton/CUDA matches; no whitespace errors in the implementation commits; no unrelated working-tree changes.
+
+### Task 7: Address code review findings
+
+**Files:**
+- Modify: `src/myvllm/layers/attention.py`
+- Modify: `src/myvllm/models/qwen3.py`
+- Modify: `tests/test_attention.py`
+
+- [x] **Step 1: Keep CPU execution independent of MLX/Metal**
+
+Add Torch fallbacks for cache writes, packed prefill, and paged decode. Import MLX lazily only when an MPS tensor reaches the native MLX path.
+
+- [x] **Step 2: Treat negative block-table entries as unmapped**
+
+Filter invalid physical blocks in the CPU path and mask them in MLX attention so `-1` never aliases the last cache block.
+
+- [x] **Step 3: Exercise `Attention.forward` on MPS**
+
+Cover cache mutation, prefill, and decode through the public module interface with device, shape, dtype, and numerical checks.
+
+- [x] **Step 4: Remove the fixed Gloo rendezvous port**
+
+Use a temporary file-based rendezvous for the one-process Qwen3 smoke program and clean it up after destroying the process group.
+
+- [x] **Step 5: Re-run CPU and Metal verification**
+
+Verify CPU-focused tests in a no-Metal sandbox and all eight tests in the host Metal environment.

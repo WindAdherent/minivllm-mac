@@ -1,3 +1,5 @@
+import tempfile
+
 from myvllm.layers import *
 import torch 
 import torch.nn as nn
@@ -352,10 +354,14 @@ if __name__ == "__main__":
         raise SystemExit("MPS is required for the Qwen3 smoke test")
 
     created_process_group = False
+    rendezvous_directory = None
     if dist.is_available() and not dist.is_initialized():
+        rendezvous_directory = tempfile.TemporaryDirectory(
+            prefix="myvllm-qwen3-"
+        )
         dist.init_process_group(
             backend="gloo",
-            init_method="tcp://127.0.0.1:29501",
+            init_method=f"file://{rendezvous_directory.name}/store",
             rank=0,
             world_size=1,
         )
@@ -386,3 +392,5 @@ if __name__ == "__main__":
     finally:
         if created_process_group:
             dist.destroy_process_group()
+        if rendezvous_directory is not None:
+            rendezvous_directory.cleanup()
