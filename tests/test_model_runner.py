@@ -72,7 +72,8 @@ class FakeSequence:
 
     @property
     def last_block_num_tokens(self):
-        return len(self.token_ids) % self.block_size or self.block_size
+        full_blocks = len(self.token_ids) // self.block_size
+        return len(self.token_ids[full_blocks * self.block_size :])
 
 
 def load_model_runner(monkeypatch):
@@ -203,14 +204,50 @@ def test_prepare_prefill_builds_mps_context(monkeypatch):
     input_ids = runner.prepare_prefill(seqs)
 
     assert input_ids.device.type == "mps"
+    assert input_ids.dtype == torch.long
     assert input_ids.cpu().tolist() == [10, 11, 12]
     context = module._test_context_state.value
+    assert context.slot_mapping.device.type == "mps"
+    assert context.slot_mapping.dtype == torch.long
     assert context.slot_mapping.cpu().tolist() == [4, 5, 6]
+    assert context.cu_seqlens_q.device.type == "mps"
     assert context.cu_seqlens_q.dtype == torch.int32
+    assert context.cu_seqlens_k.device.type == "mps"
     assert context.cu_seqlens_k.dtype == torch.int32
     assert context.cu_seqlens_q.cpu().tolist() == [0, 3]
     assert context.cu_seqlens_k.cpu().tolist() == [0, 3]
     assert context.block_tables is None
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")
+def test_prepare_prefill_builds_mps_prefix_cache_context(monkeypatch):
+    module = load_model_runner(monkeypatch)
+    runner = module.ModelRunner.__new__(module.ModelRunner)
+    runner.block_size = 2
+    runner.device = torch.device("mps")
+    seqs = [
+        FakeSequence([10, 11, 12], [2, 3], num_cached_tokens=2),
+        FakeSequence([20, 21, 22, 23, 24], [7, 8, 9], num_cached_tokens=2),
+    ]
+
+    input_ids = runner.prepare_prefill(seqs)
+
+    assert input_ids.device.type == "mps"
+    assert input_ids.dtype == torch.long
+    assert input_ids.cpu().tolist() == [12, 22, 23, 24]
+    context = module._test_context_state.value
+    assert context.slot_mapping.device.type == "mps"
+    assert context.slot_mapping.dtype == torch.long
+    assert context.slot_mapping.cpu().tolist() == [6, 16, 17, 18]
+    assert context.cu_seqlens_q.device.type == "mps"
+    assert context.cu_seqlens_q.dtype == torch.int32
+    assert context.cu_seqlens_q.cpu().tolist() == [0, 1, 4]
+    assert context.cu_seqlens_k.device.type == "mps"
+    assert context.cu_seqlens_k.dtype == torch.int32
+    assert context.cu_seqlens_k.cpu().tolist() == [0, 3, 8]
+    assert context.block_tables.device.type == "mps"
+    assert context.block_tables.dtype == torch.int32
+    assert context.block_tables.cpu().tolist() == [[2, 3, -1], [7, 8, 9]]
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")
@@ -228,11 +265,15 @@ def test_prepare_decode_and_sample_build_mps_tensors(monkeypatch):
     temperatures = runner.prepare_sample(seqs)
 
     assert input_ids.device.type == "mps"
+    assert input_ids.dtype == torch.long
     assert input_ids.cpu().tolist() == [12, 21]
     context = module._test_context_state.value
     assert context.slot_mapping.device.type == "mps"
-    assert context.slot_mapping.cpu().tolist() == [6, 15]
+    assert context.slot_mapping.dtype == torch.long
+    # Existing Sequence behavior reports zero tokens for an exactly full last block.
+    assert context.slot_mapping.cpu().tolist() == [6, 13]
     assert context.context_lens.device.type == "mps"
+    assert context.context_lens.dtype == torch.long
     assert context.context_lens.cpu().tolist() == [3, 2]
     assert context.block_tables.device.type == "mps"
     assert context.block_tables.dtype == torch.int32
