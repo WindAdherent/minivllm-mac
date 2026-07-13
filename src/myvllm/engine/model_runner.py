@@ -195,67 +195,43 @@ class ModelRunner:
     # run empty sequence to warm up the model
     # clear memory
     def warmup_model(self):
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        torch.mps.empty_cache()
         max_tokens = self.config['max_num_batch_tokens']
         max_model_length = self.config['max_model_length']
         batch_size = max_tokens // max_model_length
         seqs = [Sequence(token_ids=[0]*max_model_length, block_size=self.config['block_size']) for _ in range(batch_size)]
         self.run(seqs, is_prefill=True)
-        torch.cuda.empty_cache()
+        torch.mps.synchronize()
+        torch.mps.empty_cache()
 
     # allocate kv cache memory blocks for model
     def allocate_kv_cache(self):
         # find all available memory
-        free_mem, total_mem = torch.cuda.mem_get_info()
-        total_free_mem = free_mem * self.config['gpu_memory_utilization']
-        peak_mem_usage = torch.cuda.memory_stats()['allocated_bytes.all.peak']
-        current_mem_usage = torch.cuda.memory_stats()['allocated_bytes.all.current']
-        # reserve some room for peak memory usage during model execution
-        available_mem = total_free_mem - (peak_mem_usage - current_mem_usage)
+        torch.mps.synchronize()
+        memory_limit = int(torch.mps.recommended_max_memory() * self.config['gpu_memory_utilization'])
+        available_mem = memory_limit - torch.mps.driver_allocated_memory()
         
         # find parameters to compute kv cache size
         num_layers = self.config['num_layers']
-        num_kv_heads = self.config['num_kv_heads'] // self.world_size
-        head_dim = self.config['head_dim'] if 'head_dim' in self.config else self.config['hidden_size'] // self.config['num_heads']
+        num_kv_heads = self.config['num_kv_heads']
+        if 'head_dim' in self.config:
+            head_dim = self.config['head_dim']
+        else:
+            head_dim = self.config['hidden_size'] // self.config['num_heads']
 
         # check whether the current free memory can hold at least one block
         # compute the actual byte required of each block
         block_bytes = self.block_size * 2 * num_layers * num_kv_heads * head_dim * self.default_dtype.itemsize
         num_available_kv_blocks = int(available_mem // block_bytes)
         assert num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
-        
-        # Synchronize max_cached_blocks across all ranks.
-        # Each rank independently computed num_available_kv_blocks from its own
-        # free GPU memory. Ranks may differ slightly: rank-0 carries extra overhead
-        # (NCCL buffers, process-group state) so it often has less free memory than
-        # workers. Without sync, the scheduler (which runs only on rank-0) would use
-        # rank-0's local value and could allocate more blocks than some rank can hold,
-        # causing an OOM on that rank during KV cache writes.
-        if self.world_size > 1:
-            print(f"[Rank {self.rank}] Local max_cached_blocks: {num_available_kv_blocks}")
-            per_rank_max_blocks_tensor = torch.tensor(
-                num_available_kv_blocks,
-                dtype=torch.long,
-                device=f'cuda:{self.rank}'
-            )
-            # all_reduce with MIN: every rank learns the most conservative limit,
-            # i.e. the block count that even the most memory-constrained rank can serve.
-            # This single agreed-upon value is then stored in config so the Scheduler
-            # (initialized afterwards on rank-0) never allocates more blocks than any
-            # rank can physically hold.
-            dist.all_reduce(per_rank_max_blocks_tensor, op=dist.ReduceOp.MIN)
-            self.config['max_cached_blocks'] = per_rank_max_blocks_tensor.item()
-        else:
-            # Single GPU: no cross-rank sync needed; use the local value directly.
-            self.config['max_cached_blocks'] = num_available_kv_blocks
+        self.config['max_cached_blocks'] = num_available_kv_blocks
         if self.rank == 0:
             print(f"[Rank 0] Global max_cached_blocks (min): {self.config['max_cached_blocks']}")
 
         # allocate max possible kv cache for the model, instead for each sequence
         # this is the key for paged attention: one giant KV cache pool, divided into blocks
         # IMPORTANT: Use zeros() instead of empty() to avoid garbage values
-        allocated_kv_cache = torch.zeros(2, self.config['num_layers'], self.config['max_cached_blocks'], self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}')
+        allocated_kv_cache = torch.zeros(2, num_layers, self.config['max_cached_blocks'], self.block_size, num_kv_heads, head_dim, dtype=self.default_dtype, device=self.device)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, 'k_cache') and hasattr(module, 'v_cache'):

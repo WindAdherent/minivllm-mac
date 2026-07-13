@@ -40,6 +40,20 @@ class DummySequence:
         self.block_size = block_size
 
 
+class CacheLayer:
+    def __init__(self):
+        self.k_cache = None
+        self.v_cache = None
+
+
+class CacheModel:
+    def __init__(self, layers):
+        self.layers = layers
+
+    def modules(self):
+        return iter(self.layers)
+
+
 class FakeSequence:
     def __init__(
         self,
@@ -191,6 +205,56 @@ def test_constructor_uses_gloo_and_moves_model_to_mps(monkeypatch):
     assert runner.model.moved_to == torch.device("mps")
     assert init_calls == [("gloo", "tcp://localhost:12345", 1, 0)]
     assert default_devices == [torch.device("mps")]
+
+
+def test_warmup_uses_mps_cache_and_synchronization(monkeypatch):
+    module = load_model_runner(monkeypatch)
+    runner = module.ModelRunner.__new__(module.ModelRunner)
+    runner.config = {
+        "max_num_batch_tokens": 8,
+        "max_model_length": 4,
+        "block_size": 2,
+    }
+    calls = []
+
+    monkeypatch.setattr(module.torch.mps, "empty_cache", lambda: calls.append("empty"))
+    monkeypatch.setattr(module.torch.mps, "synchronize", lambda: calls.append("sync"))
+    runner.run = lambda seqs, is_prefill: calls.append((len(seqs), is_prefill))
+
+    runner.warmup_model()
+
+    assert calls == ["empty", (2, True), "sync", "empty"]
+
+
+def test_allocate_kv_cache_uses_mps_working_set_budget(monkeypatch):
+    module = load_model_runner(monkeypatch)
+    runner = module.ModelRunner.__new__(module.ModelRunner)
+    runner.config = {
+        "num_layers": 2,
+        "num_kv_heads": 2,
+        "head_dim": 4,
+        "gpu_memory_utilization": 0.5,
+    }
+    runner.world_size = 1
+    runner.rank = 0
+    runner.block_size = 2
+    runner.default_dtype = torch.float32
+    runner.device = torch.device("cpu")
+    layers = [CacheLayer(), CacheLayer()]
+    runner.model = CacheModel(layers)
+
+    monkeypatch.setattr(module.torch.mps, "synchronize", lambda: None)
+    monkeypatch.setattr(module.torch.mps, "recommended_max_memory", lambda: 1024)
+    monkeypatch.setattr(module.torch.mps, "driver_allocated_memory", lambda: 128)
+
+    runner.allocate_kv_cache()
+
+    assert runner.config["max_cached_blocks"] == 1
+    for layer in layers:
+        assert layer.k_cache.shape == (1, 2, 2, 4)
+        assert layer.v_cache.shape == (1, 2, 2, 4)
+        assert torch.count_nonzero(layer.k_cache) == 0
+        assert torch.count_nonzero(layer.v_cache) == 0
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")
