@@ -40,6 +40,41 @@ class DummySequence:
         self.block_size = block_size
 
 
+class FakeSequence:
+    def __init__(
+        self,
+        token_ids,
+        block_table,
+        block_size=2,
+        num_cached_tokens=0,
+        temperature=0.7,
+    ):
+        self.token_ids = token_ids
+        self.block_table = block_table
+        self.block_size = block_size
+        self.num_cached_tokens = num_cached_tokens
+        self.temperature = temperature
+
+    @property
+    def last_token(self):
+        return self.token_ids[-1]
+
+    def __len__(self):
+        return len(self.token_ids)
+
+    @property
+    def num_cached_blocks(self):
+        return (self.num_cached_tokens + self.block_size - 1) // self.block_size
+
+    @property
+    def num_blocks(self):
+        return (len(self.token_ids) + self.block_size - 1) // self.block_size
+
+    @property
+    def last_block_num_tokens(self):
+        return len(self.token_ids) % self.block_size or self.block_size
+
+
 def load_model_runner(monkeypatch):
     qwen3_module = ModuleType("myvllm.models.qwen3")
     qwen3_module.Qwen3ForCausalLM = DummyModel
@@ -57,16 +92,16 @@ def load_model_runner(monkeypatch):
     sequence_module.Sequence = DummySequence
     monkeypatch.setitem(sys.modules, sequence_module.__name__, sequence_module)
 
-    context_state = SimpleNamespace(context=None)
+    context_state = SimpleNamespace(value=None)
 
     def set_context(**kwargs):
-        context_state.context = SimpleNamespace(**kwargs)
+        context_state.value = SimpleNamespace(**kwargs)
 
     def get_context():
-        return context_state.context
+        return context_state.value
 
     def reset_context():
-        context_state.context = None
+        context_state.value = None
 
     utils_module = ModuleType("myvllm.utils")
     utils_module.__path__ = []
@@ -155,3 +190,54 @@ def test_constructor_uses_gloo_and_moves_model_to_mps(monkeypatch):
     assert runner.model.moved_to == torch.device("mps")
     assert init_calls == [("gloo", "tcp://localhost:12345", 1, 0)]
     assert default_devices == [torch.device("mps")]
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")
+def test_prepare_prefill_builds_mps_context(monkeypatch):
+    module = load_model_runner(monkeypatch)
+    runner = module.ModelRunner.__new__(module.ModelRunner)
+    runner.block_size = 2
+    runner.device = torch.device("mps")
+    seqs = [FakeSequence([10, 11, 12], [2, 3])]
+
+    input_ids = runner.prepare_prefill(seqs)
+
+    assert input_ids.device.type == "mps"
+    assert input_ids.cpu().tolist() == [10, 11, 12]
+    context = module._test_context_state.value
+    assert context.slot_mapping.cpu().tolist() == [4, 5, 6]
+    assert context.cu_seqlens_q.dtype == torch.int32
+    assert context.cu_seqlens_q.cpu().tolist() == [0, 3]
+    assert context.cu_seqlens_k.cpu().tolist() == [0, 3]
+    assert context.block_tables is None
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")
+def test_prepare_decode_and_sample_build_mps_tensors(monkeypatch):
+    module = load_model_runner(monkeypatch)
+    runner = module.ModelRunner.__new__(module.ModelRunner)
+    runner.block_size = 2
+    runner.device = torch.device("mps")
+    seqs = [
+        FakeSequence([10, 11, 12], [2, 3], temperature=0.25),
+        FakeSequence([20, 21], [7], temperature=0.9),
+    ]
+
+    input_ids = runner.prepare_decode(seqs)
+    temperatures = runner.prepare_sample(seqs)
+
+    assert input_ids.device.type == "mps"
+    assert input_ids.cpu().tolist() == [12, 21]
+    context = module._test_context_state.value
+    assert context.slot_mapping.device.type == "mps"
+    assert context.slot_mapping.cpu().tolist() == [6, 15]
+    assert context.context_lens.device.type == "mps"
+    assert context.context_lens.cpu().tolist() == [3, 2]
+    assert context.block_tables.device.type == "mps"
+    assert context.block_tables.dtype == torch.int32
+    assert context.block_tables.cpu().tolist() == [[2, 3], [7, -1]]
+    assert temperatures.device.type == "mps"
+    assert temperatures.dtype == torch.float32
+    torch.testing.assert_close(
+        temperatures.cpu(), torch.tensor([0.25, 0.9], dtype=torch.float32)
+    )

@@ -309,18 +309,18 @@ class ModelRunner:
             for i, seq in enumerate(seqs):
                 block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
                 block_tables.append(block_table)
-        input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping_tensor = torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        input_ids = torch.tensor(input_ids, dtype=torch.long, device=self.device)
+        slot_mapping_tensor = torch.tensor(slot_mappings, dtype=torch.long, device=self.device)
 
         set_context(
             is_prefill=True,
-            cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            cu_seqlens_k=torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, device=self.device),
+            cu_seqlens_k=torch.tensor(cu_seqlens_k, dtype=torch.int32, device=self.device),
             max_seqlen_q=max(seqlens_q),
             max_seqlen_k=max(seqlens_k),
             slot_mapping=slot_mapping_tensor,
             context_lens=None,
-            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
+            block_tables=torch.tensor(block_tables, dtype=torch.int32, device=self.device) if block_tables else None,
         )
         return input_ids
 
@@ -340,22 +340,22 @@ class ModelRunner:
         for i, seq in enumerate(seqs):
             block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
             block_tables.append(block_table)
-        input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        input_ids = torch.tensor(input_ids, dtype=torch.long, device=self.device)
         set_context(
             is_prefill=False,
             cu_seqlens_q=None,
             cu_seqlens_k=None,
             max_seqlen_q=0,
             max_seqlen_k=0,
-            slot_mapping=torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
-            context_lens=torch.tensor(context_lens, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
-            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
+            slot_mapping=torch.tensor(slot_mappings, dtype=torch.long, device=self.device),
+            context_lens=torch.tensor(context_lens, dtype=torch.long, device=self.device),
+            block_tables=torch.tensor(block_tables, dtype=torch.int32, device=self.device) if block_tables else None,
         )
         return input_ids    
 
     # prepare the temperature
-    def prepare_sample(self, seqs: list[Sequence]) -> None:
-        return torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+    def prepare_sample(self, seqs: list[Sequence]) -> torch.Tensor:
+        return torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, device=self.device)
 
     # when prefilling, directly compute model forward + logits
     # when decoding, use cuda graph execution to speed up
