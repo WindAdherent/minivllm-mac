@@ -335,7 +335,7 @@ git commit -m "feat: run varlen prefill attention with MLX"
 - Modify: `src/myvllm/layers/attention.py`
 - Test: `tests/test_attention.py`
 
-- [ ] **Step 1: Run the paged decode test to verify RED**
+- [x] **Step 1: Run the paged decode test to verify RED**
 
 Run:
 
@@ -345,7 +345,7 @@ uv run --no-sync pytest tests/test_attention.py::test_paged_attention_decode_fol
 
 Expected: FAIL until the Triton decode kernel is replaced.
 
-- [ ] **Step 2: Implement MLX paged gathering and decode**
+- [x] **Step 2: Implement MLX paged gathering and decode**
 
 Convert cache tables once and compute each batch row as follows:
 
@@ -376,7 +376,7 @@ return _mlx_to_torch(mx.stack(outputs, axis=0), query)
 
 Keep `Attention.__init__` and `Attention.forward` signatures and branching unchanged, removing only Triton-specific comments and operations.
 
-- [ ] **Step 3: Run the complete attention behavior suite to verify GREEN**
+- [x] **Step 3: Run the complete attention behavior suite to verify GREEN**
 
 Run:
 
@@ -386,7 +386,7 @@ uv run --no-sync pytest tests/test_attention.py -v
 
 Expected: all current attention tests pass.
 
-- [ ] **Step 4: Commit the decode slice**
+- [x] **Step 4: Commit the decode slice**
 
 ```bash
 git add src/myvllm/layers/attention.py tests/test_attention.py
