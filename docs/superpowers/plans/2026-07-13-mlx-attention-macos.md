@@ -285,7 +285,7 @@ git commit -m "refactor: move KV cache storage to MLX"
 - Modify: `src/myvllm/layers/attention.py`
 - Test: `tests/test_attention.py`
 
-- [ ] **Step 1: Run the prefill test to verify RED**
+- [x] **Step 1: Run the prefill test to verify RED**
 
 Run:
 
@@ -295,7 +295,7 @@ uv run --no-sync pytest tests/test_attention.py::test_flash_attention_prefill_ha
 
 Expected: FAIL until `flash_attention_prefill` uses the new MLX implementation.
 
-- [ ] **Step 2: Implement packed per-sequence MLX attention**
+- [x] **Step 2: Implement packed per-sequence MLX attention**
 
 Convert Q/K/V once, preserve packed sequence boundaries, and use native GQA without repeating K/V heads:
 
@@ -318,11 +318,11 @@ if not outputs:
 return _mlx_to_torch(mx.concatenate(outputs, axis=0), q)
 ```
 
-- [ ] **Step 3: Run the prefill test to verify GREEN**
+- [x] **Step 3: Run the prefill test to verify GREEN**
 
 Run the same focused test. Expected: 1 passed with CPU Torch output matching the reference.
 
-- [ ] **Step 4: Commit the prefill slice**
+- [x] **Step 4: Commit the prefill slice**
 
 ```bash
 git add src/myvllm/layers/attention.py tests/test_attention.py

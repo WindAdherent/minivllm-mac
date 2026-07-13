@@ -92,52 +92,38 @@ def flash_attention_prefill(
     Returns:
         output: (total_tokens, num_heads, head_dim)
     """
-    # Make tensors contiguous
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
-    
-    # Allocate output
-    output = torch.empty_like(q)
-    
-    # Conservative block sizes to avoid OOM on shared memory
-    # Shared memory usage ~ BLOCK_M * BLOCK_N * 4 bytes (for float32 attention scores)
-    # + BLOCK_M * head_dim * 4 (for Q)
-    # + BLOCK_N * head_dim * 4 (for K, V)
-    # Want to keep total < 48KB for most GPUs
-    
-    if head_dim <= 64:
-        BLOCK_M = 64
-        BLOCK_N = 64
-    elif head_dim <= 128:
-        BLOCK_M = 32
-        BLOCK_N = 32
-    else:
-        BLOCK_M = 16
-        BLOCK_N = 16
-    
-    # Number of sequences
-    num_seqs = cu_seqlens.shape[0] - 1
-    
-    # Find max sequence length to determine grid size
-    cu_seqlens_cpu = cu_seqlens.cpu()
-    max_seq_len = (cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]).max().item()
-    
-    # Calculate grid dimensions - launch all kernels at once
-    grid = (triton.cdiv(max_seq_len, BLOCK_M), num_heads, num_seqs)
-    
-    flash_attention_varlen_kernel[grid](
-        q, k, v, output,
-        cu_seqlens,
-        scale,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-    )
-    
-    return output
+    q_mx = _torch_to_mlx(q)
+    k_mx = _torch_to_mlx(k)
+    v_mx = _torch_to_mlx(v)
+    boundaries = cu_seqlens.detach().to(
+        device="cpu", dtype=torch.long
+    ).tolist()
+    outputs = []
+
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        if start == end:
+            continue
+        query = mx.expand_dims(
+            mx.transpose(q_mx[start:end], (1, 0, 2)), axis=0
+        )
+        key = mx.expand_dims(
+            mx.transpose(k_mx[start:end], (1, 0, 2)), axis=0
+        )
+        value = mx.expand_dims(
+            mx.transpose(v_mx[start:end], (1, 0, 2)), axis=0
+        )
+        sequence_output = mx.fast.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            scale=scale,
+            mask="causal",
+        )
+        outputs.append(mx.transpose(sequence_output[0], (1, 0, 2)))
+
+    if not outputs:
+        return torch.empty_like(q)
+    return _mlx_to_torch(mx.concatenate(outputs, axis=0), q)
 
 
 def paged_attention_decode_kernel(
