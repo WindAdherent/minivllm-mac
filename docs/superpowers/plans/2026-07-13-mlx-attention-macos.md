@@ -537,7 +537,7 @@ git commit -m "test: add macOS MLX attention smoke programs"
 - Verify: `src/myvllm/models/qwen3.py`
 - Verify: `tests/test_attention.py`
 
-- [ ] **Step 1: Run focused tests**
+- [x] **Step 1: Run focused tests**
 
 ```bash
 uv run --no-sync pytest tests/test_attention.py -v
@@ -545,7 +545,7 @@ uv run --no-sync pytest tests/test_attention.py -v
 
 Expected: every attention compatibility test passes.
 
-- [ ] **Step 2: Run the full test suite**
+- [x] **Step 2: Run the full test suite**
 
 ```bash
 uv run --no-sync pytest -v
@@ -553,7 +553,7 @@ uv run --no-sync pytest -v
 
 Expected: zero failures.
 
-- [ ] **Step 3: Re-run requested main programs from a clean Python process**
+- [x] **Step 3: Re-run requested main programs from a clean Python process**
 
 ```bash
 uv run --no-sync python src/myvllm/layers/attention.py
@@ -562,7 +562,7 @@ uv run --no-sync python src/myvllm/models/qwen3.py
 
 Expected: both exit with status 0 and print their documented shapes.
 
-- [ ] **Step 4: Verify source scope and diff quality**
+- [x] **Step 4: Verify source scope and diff quality**
 
 ```bash
 rg -n -i "import triton|@triton|\.cuda\(|torch\.cuda\." src/myvllm/layers src/myvllm/models/qwen3.py
