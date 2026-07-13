@@ -207,6 +207,7 @@ def test_prepare_prefill_builds_mps_context(monkeypatch):
     context = module._test_context_state.value
     assert context.slot_mapping.cpu().tolist() == [4, 5, 6]
     assert context.cu_seqlens_q.dtype == torch.int32
+    assert context.cu_seqlens_k.dtype == torch.int32
     assert context.cu_seqlens_q.cpu().tolist() == [0, 3]
     assert context.cu_seqlens_k.cpu().tolist() == [0, 3]
     assert context.block_tables is None
