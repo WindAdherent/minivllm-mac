@@ -1,6 +1,7 @@
 from myvllm.layers import *
 import torch 
 import torch.nn as nn
+import torch.distributed as dist
 
 # Qwen3Attention: 
 # qkv projection
@@ -345,13 +346,43 @@ class Qwen3ForCausalLM(nn.Module):
         return logits
 
 if __name__ == "__main__":
-    model = Qwen3ForCausalLM(
-        vocab_size=50257,
-        hidden_size=768,
-        num_heads=12,
-        head_dim=64,
-        intermediate_size=3072,
-        num_layers=2,
-    )
-    input_ids = torch.randint(0, 50257, (2, 16)).cuda()
-    output = model(input_ids)
+    from myvllm.utils import set_context
+
+    if not torch.backends.mps.is_available():
+        raise SystemExit("MPS is required for the Qwen3 smoke test")
+
+    created_process_group = False
+    if dist.is_available() and not dist.is_initialized():
+        dist.init_process_group(
+            backend="gloo",
+            init_method="tcp://127.0.0.1:29501",
+            rank=0,
+            world_size=1,
+        )
+        created_process_group = True
+
+    try:
+        device = torch.device("mps")
+        model = Qwen3ForCausalLM(
+            vocab_size=128,
+            hidden_size=64,
+            num_heads=4,
+            head_dim=16,
+            intermediate_size=128,
+            num_layers=1,
+        ).to(device).eval()
+        num_tokens = 8
+        set_context(
+            is_prefill=True,
+            cu_seqlens_q=torch.tensor([0, num_tokens], device=device),
+        )
+        input_ids = torch.randint(
+            0, 128, (num_tokens,), device=device
+        )
+        with torch.inference_mode():
+            output = model(input_ids)
+        torch.mps.synchronize()
+        print("qwen3:", tuple(output.shape))
+    finally:
+        if created_process_group:
+            dist.destroy_process_group()

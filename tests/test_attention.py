@@ -208,3 +208,13 @@ def test_mps_cache_and_prefill_preserve_device_and_values():
     torch.testing.assert_close(
         output.cpu(), expected, rtol=1e-5, atol=1e-5
     )
+
+
+def test_scoped_sources_have_no_cuda_or_triton_execution():
+    paths = sorted((ROOT / "src" / "myvllm" / "layers").glob("*.py"))
+    paths.append(ROOT / "src" / "myvllm" / "models" / "qwen3.py")
+    source = "\n".join(path.read_text() for path in paths)
+
+    assert "import triton" not in source
+    assert ".cuda(" not in source
+    assert "torch.cuda." not in source

@@ -400,7 +400,7 @@ git commit -m "feat: run paged decode attention with MLX"
 - Modify: `src/myvllm/models/qwen3.py`
 - Test: `tests/test_attention.py`
 
-- [ ] **Step 1: Add a failing executable-source scan**
+- [x] **Step 1: Add a failing executable-source scan**
 
 Append:
 
@@ -416,7 +416,7 @@ def test_scoped_sources_have_no_cuda_or_triton_execution():
 
 Run the test and expect it to fail on the existing CUDA main calls.
 
-- [ ] **Step 2: Replace the attention benchmark with a small MPS prefill/decode smoke test**
+- [x] **Step 2: Replace the attention benchmark with a small MPS prefill/decode smoke test**
 
 Replace the old CUDA timing block with:
 
@@ -465,7 +465,7 @@ if __name__ == "__main__":
     print("decode:", tuple(decode_output.shape))
 ```
 
-- [ ] **Step 3: Replace the qwen3 CUDA example with a small initialized MPS prefill**
+- [x] **Step 3: Replace the qwen3 CUDA example with a small initialized MPS prefill**
 
 Add `import torch.distributed as dist` explicitly and use this main block:
 
@@ -511,7 +511,7 @@ if __name__ == "__main__":
             dist.destroy_process_group()
 ```
 
-- [ ] **Step 4: Verify the source scan and both main programs**
+- [x] **Step 4: Verify the source scan and both main programs**
 
 Run outside the restricted sandbox so Metal is visible:
 
@@ -523,7 +523,7 @@ uv run --no-sync python src/myvllm/models/qwen3.py
 
 Expected: source scan passes; attention main prints prefill `(4, 64)` and decode `(1, 64)` shapes; qwen3 main prints `(8, 64)`.
 
-- [ ] **Step 5: Commit the macOS smoke tests**
+- [x] **Step 5: Commit the macOS smoke tests**
 
 ```bash
 git add src/myvllm/layers/attention.py src/myvllm/models/qwen3.py tests/test_attention.py

@@ -254,29 +254,47 @@ class Attention(nn.Module):
 
 
 if __name__ == "__main__":
-    layer = Attention(num_heads=8, head_dim=64).cuda()
-    batch_size, sequence_length, hidden_size = 4, 1024, 512
-    q = torch.randn(batch_size, sequence_length, hidden_size).cuda()
-    k = torch.randn(batch_size, sequence_length, hidden_size).cuda()
-    v = torch.randn(batch_size, sequence_length, hidden_size).cuda()
-    layer.k_cache = torch.zeros(
-        batch_size, sequence_length, hidden_size
-    ).cuda()
-    layer.v_cache = torch.zeros(
-        batch_size, sequence_length, hidden_size
-    ).cuda()
+    from myvllm.utils import set_context
 
-    for _ in range(10):
-        _ = layer(q, k, v)
+    if not torch.backends.mps.is_available():
+        raise SystemExit("MPS is required for the attention smoke test")
 
-    import time
+    torch.manual_seed(0)
+    device = torch.device("mps")
+    layer = Attention(
+        num_heads=4,
+        head_dim=16,
+        num_kv_heads=2,
+        block_size=2,
+    ).to(device)
+    layer.k_cache = torch.zeros(3, 2, 2, 16, device=device)
+    layer.v_cache = torch.zeros_like(layer.k_cache)
 
-    times = []
-    for _ in range(100):
-        torch.cuda.synchronize()
-        start_time = time.time()
-        _ = layer(q, k, v)
-        torch.cuda.synchronize()
-        times.append(time.time() - start_time)
-    average_time = sum(times) / len(times)
-    print(f"Average inference time: {average_time * 1000:.4f} ms")
+    set_context(
+        is_prefill=True,
+        cu_seqlens_q=torch.tensor([0, 4], device=device),
+        slot_mapping=torch.arange(4, device=device),
+    )
+    with torch.inference_mode():
+        prefill_output = layer(
+            torch.randn(4, 4, 16, device=device),
+            torch.randn(4, 2, 16, device=device),
+            torch.randn(4, 2, 16, device=device),
+        )
+
+    set_context(
+        is_prefill=False,
+        slot_mapping=torch.tensor([4], device=device),
+        context_lens=torch.tensor([5], device=device),
+        block_tables=torch.tensor([[0, 1, 2]], device=device),
+    )
+    with torch.inference_mode():
+        decode_output = layer(
+            torch.randn(1, 4, 16, device=device),
+            torch.randn(1, 2, 16, device=device),
+            torch.randn(1, 2, 16, device=device),
+        )
+
+    torch.mps.synchronize()
+    print("prefill:", tuple(prefill_output.shape))
+    print("decode:", tuple(decode_output.shape))
