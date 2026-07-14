@@ -18,35 +18,28 @@
 
 `src/myvllm/engine/model_runner.py` began as a 458-line user-owned worktree modification relative to an empty tracked file. Its content was copied by patch into the isolated feature worktree before implementation. Do not reset, restore, or replace it wholesale; apply focused patches to the copied content and review its complete final diff before staging.
 
-## Execution checkpoint — paused 2026-07-13
+## Execution status — implementation verified 2026-07-14
 
-Work is intentionally paused in the isolated worktree at `/Users/chowhound/VSCodeProjects/minivllm-mac/.worktrees/model-runner-mps` on branch `feat/model-runner-mps`.
+Implementation and task-level reviews are complete in the isolated worktree at `/Users/chowhound/VSCodeProjects/minivllm-mac/.worktrees/model-runner-mps` on branch `feat/model-runner-mps`:
 
-Completed and reviewed:
+- Task 1 is complete and reviewed at `0278337`.
+  - Runtime validation, single-rank Gloo initialization, and MPS model/default-device placement are retained.
+- Task 2 is complete and reviewed across `06344a5`, `9790baa`, and `51e9a3f`.
+  - Prefill, decode, context, block-table, and sampling tensors use MPS, with real-`Sequence`, prefix-cache, dtype, and device coverage.
+- Task 3 was implemented at `ba2af91` and its warmup-memory reserve was fixed at `bbb6d01`.
+  - MPS warmup APIs and single-rank working-set cache sizing are implemented; specification and code-quality reviews passed.
+  - A possible refinement to reduce overlap in the deliberately conservative warmup reserve remains a nonblocking suggestion, not a correctness or approval blocker.
+- Task 4 is complete and reviewed at `5c82183`.
+  - Decode runs eagerly on MPS and the remaining graph-capture lifecycle was removed without changing sampling or context-reset behavior.
+- Task 5 fresh verification completed on 2026-07-14:
+  - `/Users/chowhound/VSCodeProjects/minivllm-mac/.venv/bin/python -m pytest -q` exited 0 with `23 passed in 2.02s`, zero failures, and no MPS skips.
+  - `/Users/chowhound/VSCodeProjects/minivllm-mac/.venv/bin/python -m py_compile src/myvllm/engine/model_runner.py tests/test_model_runner.py` exited 0 with no output.
+  - Case-insensitive `cuda|nccl` and graph-state scans (`capture|replay|graph_pool|graph_vars|self\.graphs`) each exited 1 with no matches in `model_runner.py`.
+  - `git diff --check` exited 0, and `git status --short` was clean before this status update.
+  - Relative to `d94844c`, the feature changes are limited to `src/myvllm/engine/model_runner.py`, `tests/test_model_runner.py`, and this implementation plan; no file outside the allowed runner, tests, design-spec, and implementation-plan scope changed.
+  - The main worktree's pre-existing modification to `src/myvllm/engine/model_runner.py` is user-owned and was not changed while executing the feature worktree.
 
-- Task 1 implementation: `02783373254dce78ef15ed6c7dcffdeb3b89f79b`.
-  - Runtime validation, single-rank Gloo initialization, and MPS model/default-device placement.
-  - Specification and code-quality reviews passed.
-- Task 2 implementation and review fixes: `06344a5dfd645dea720b3e9f91bf62b75bd5af90`, `9790baaa44c3b24c0bf233fc6d54951b87ac4e9f`, and `51e9a3fb422cb00bbd919ff86f51c363c412f7f2`.
-  - Prefill, decode, context, block-table, and sampling tensors now use MPS.
-  - Specification and code-quality reviews passed after strengthening real-`Sequence`, prefix-cache, dtype, and device coverage.
-
-Task 3 status:
-
-- Implementation commit: `ba2af91a7b6506b9d9306cbd78630c8d9c9742fa`.
-- MPS warmup APIs and single-rank MPS working-set cache sizing are implemented.
-- TDD focused tests passed; the host-MPS model-runner suite reported 7 passed with no skips.
-- Specification review passed.
-- Code-quality review is not approved. The following Important issue remains open:
-  - `warmup_model` clears transient allocator memory, while `allocate_kv_cache` subtracts only current `driver_allocated_memory`. This can allocate the remaining utilization budget to KV cache without reserving the transient memory observed during model execution, risking memory pressure or OOM during a later prefill.
-  - Resume by adding a deterministic failing test for transient warmup reserve, recording a conservative reserve during warmup, subtracting it from the cache budget, and rerunning Task 3 specification and quality reviews.
-
-Additional Task 3 review notes to address with the same focused patch:
-
-- Rename the single-rank diagnostic from `Global max_cached_blocks (min)` to an accurate message.
-- Add tests for a below-one-block budget, synchronization before memory queries, and the `hidden_size // num_heads` fallback when `head_dim` is absent.
-
-Do not begin Task 4 until Task 3 passes both review gates. After Task 3 is approved, continue with eager decode/CUDA Graph removal, full integration verification, final code review, and branch finishing.
+Final whole-feature review remains next. The branch has not been integrated or merged.
 
 ### Task 1: Establish isolated tests and MPS runtime initialization
 
