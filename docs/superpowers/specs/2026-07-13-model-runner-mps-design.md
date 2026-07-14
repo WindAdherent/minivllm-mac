@@ -54,16 +54,17 @@ Pinned host allocation and CUDA-specific nonblocking copies are removed. They ar
 
 ### Warmup and memory accounting
 
-Warmup continues to execute the largest configured synthetic prefill before KV-cache allocation. It uses `torch.mps.empty_cache()` around the run and `torch.mps.synchronize()` before memory measurements so queued Metal work is reflected in the accounting.
+Warmup continues to execute the largest configured synthetic prefill before KV-cache allocation. The baseline driver allocation is measured after the initial `torch.mps.empty_cache()`. Post-warmup driver allocation is measured after the synthetic run and `torch.mps.synchronize()`, but before the final cache clear, so queued Metal work and transient execution allocations are reflected in the accounting.
 
 MPS has no CUDA-style peak-memory reset/statistics contract. The KV-cache budget is therefore computed from the device's recommended working-set limit:
 
 ```text
 memory_limit = recommended_max_memory * gpu_memory_utilization
-available_for_cache = memory_limit - driver_allocated_memory
+warmup_memory_reserve = max(post_warmup_driver_memory - baseline_driver_memory, 0)
+available_for_cache = memory_limit - driver_allocated_memory - warmup_memory_reserve
 ```
 
-`driver_allocated_memory` is used because it includes current framework/device allocations that compete for the Metal working set. The existing block-size calculation then converts the available byte budget into `max_cached_blocks`. A non-positive budget or fewer than one block raises the existing not-enough-memory assertion with rank context.
+`driver_allocated_memory` includes the current framework/device allocations that compete for the Metal working set when the cache budget is calculated. The additional warmup reserve conservatively preserves headroom for allocations observed during model execution even after the final cache clear releases transient cached memory. The existing block-size calculation then converts the remaining byte budget into `max_cached_blocks`. A non-positive budget or fewer than one block raises the existing not-enough-memory assertion with rank context.
 
 ### KV-cache allocation
 
