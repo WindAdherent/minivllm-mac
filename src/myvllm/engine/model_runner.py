@@ -196,12 +196,15 @@ class ModelRunner:
     # clear memory
     def warmup_model(self):
         torch.mps.empty_cache()
+        baseline_memory = torch.mps.driver_allocated_memory()
         max_tokens = self.config['max_num_batch_tokens']
         max_model_length = self.config['max_model_length']
         batch_size = max_tokens // max_model_length
         seqs = [Sequence(token_ids=[0]*max_model_length, block_size=self.config['block_size']) for _ in range(batch_size)]
         self.run(seqs, is_prefill=True)
         torch.mps.synchronize()
+        warmup_memory = torch.mps.driver_allocated_memory()
+        self._warmup_memory_reserve = max(warmup_memory - baseline_memory, 0)
         torch.mps.empty_cache()
 
     # allocate kv cache memory blocks for model
@@ -209,7 +212,9 @@ class ModelRunner:
         # find all available memory
         torch.mps.synchronize()
         memory_limit = int(torch.mps.recommended_max_memory() * self.config['gpu_memory_utilization'])
-        available_mem = memory_limit - torch.mps.driver_allocated_memory()
+        driver_allocated_memory = torch.mps.driver_allocated_memory()
+        warmup_memory_reserve = getattr(self, '_warmup_memory_reserve', 0)
+        available_mem = memory_limit - driver_allocated_memory - warmup_memory_reserve
         
         # find parameters to compute kv cache size
         num_layers = self.config['num_layers']
@@ -226,7 +231,7 @@ class ModelRunner:
         assert num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
         self.config['max_cached_blocks'] = num_available_kv_blocks
         if self.rank == 0:
-            print(f"[Rank 0] Global max_cached_blocks (min): {self.config['max_cached_blocks']}")
+            print(f"[Rank 0] max_cached_blocks: {self.config['max_cached_blocks']}")
 
         # allocate max possible kv cache for the model, instead for each sequence
         # this is the key for paged attention: one giant KV cache pool, divided into blocks

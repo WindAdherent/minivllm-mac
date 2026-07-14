@@ -216,9 +216,15 @@ def test_warmup_uses_mps_cache_and_synchronization(monkeypatch):
         "block_size": 2,
     }
     calls = []
+    driver_allocated_memory = iter([128, 384])
 
     monkeypatch.setattr(module.torch.mps, "empty_cache", lambda: calls.append("empty"))
     monkeypatch.setattr(module.torch.mps, "synchronize", lambda: calls.append("sync"))
+    monkeypatch.setattr(
+        module.torch.mps,
+        "driver_allocated_memory",
+        lambda: next(driver_allocated_memory),
+    )
     runner.run = lambda seqs, is_prefill: calls.append((len(seqs), is_prefill))
 
     runner.warmup_model()
@@ -226,7 +232,31 @@ def test_warmup_uses_mps_cache_and_synchronization(monkeypatch):
     assert calls == ["empty", (2, True), "sync", "empty"]
 
 
-def test_allocate_kv_cache_uses_mps_working_set_budget(monkeypatch):
+def test_warmup_records_transient_mps_memory_reserve(monkeypatch):
+    module = load_model_runner(monkeypatch)
+    runner = module.ModelRunner.__new__(module.ModelRunner)
+    runner.config = {
+        "max_num_batch_tokens": 8,
+        "max_model_length": 4,
+        "block_size": 2,
+    }
+    driver_allocated_memory = iter([128, 384])
+
+    monkeypatch.setattr(module.torch.mps, "empty_cache", lambda: None)
+    monkeypatch.setattr(module.torch.mps, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        module.torch.mps,
+        "driver_allocated_memory",
+        lambda: next(driver_allocated_memory),
+    )
+    runner.run = lambda seqs, is_prefill: None
+
+    runner.warmup_model()
+
+    assert runner._warmup_memory_reserve == 256
+
+
+def test_allocate_kv_cache_uses_mps_working_set_budget(monkeypatch, capsys):
     module = load_model_runner(monkeypatch)
     runner = module.ModelRunner.__new__(module.ModelRunner)
     runner.config = {
@@ -242,9 +272,57 @@ def test_allocate_kv_cache_uses_mps_working_set_budget(monkeypatch):
     runner.device = torch.device("cpu")
     layers = [CacheLayer(), CacheLayer()]
     runner.model = CacheModel(layers)
+    calls = []
+
+    monkeypatch.setattr(
+        module.torch.mps, "synchronize", lambda: calls.append("synchronize")
+    )
+    monkeypatch.setattr(
+        module.torch.mps,
+        "recommended_max_memory",
+        lambda: calls.append("recommended_max_memory") or 1024,
+    )
+    monkeypatch.setattr(
+        module.torch.mps,
+        "driver_allocated_memory",
+        lambda: calls.append("driver_allocated_memory") or 128,
+    )
+
+    runner.allocate_kv_cache()
+
+    assert calls == [
+        "synchronize",
+        "recommended_max_memory",
+        "driver_allocated_memory",
+    ]
+    assert runner.config["max_cached_blocks"] == 1
+    assert "[Rank 0] max_cached_blocks: 1" in capsys.readouterr().out
+    for layer in layers:
+        assert layer.k_cache.shape == (1, 2, 2, 4)
+        assert layer.v_cache.shape == (1, 2, 2, 4)
+        assert torch.count_nonzero(layer.k_cache) == 0
+        assert torch.count_nonzero(layer.v_cache) == 0
+
+
+def test_allocate_kv_cache_reserves_warmup_transient_memory(monkeypatch):
+    module = load_model_runner(monkeypatch)
+    runner = module.ModelRunner.__new__(module.ModelRunner)
+    runner.config = {
+        "num_layers": 2,
+        "num_kv_heads": 2,
+        "head_dim": 4,
+        "gpu_memory_utilization": 0.5,
+    }
+    runner.rank = 0
+    runner.block_size = 2
+    runner.default_dtype = torch.float32
+    runner.device = torch.device("cpu")
+    runner._warmup_memory_reserve = 256
+    layers = [CacheLayer(), CacheLayer()]
+    runner.model = CacheModel(layers)
 
     monkeypatch.setattr(module.torch.mps, "synchronize", lambda: None)
-    monkeypatch.setattr(module.torch.mps, "recommended_max_memory", lambda: 1024)
+    monkeypatch.setattr(module.torch.mps, "recommended_max_memory", lambda: 1536)
     monkeypatch.setattr(module.torch.mps, "driver_allocated_memory", lambda: 128)
 
     runner.allocate_kv_cache()
@@ -253,8 +331,55 @@ def test_allocate_kv_cache_uses_mps_working_set_budget(monkeypatch):
     for layer in layers:
         assert layer.k_cache.shape == (1, 2, 2, 4)
         assert layer.v_cache.shape == (1, 2, 2, 4)
-        assert torch.count_nonzero(layer.k_cache) == 0
-        assert torch.count_nonzero(layer.v_cache) == 0
+
+
+def test_allocate_kv_cache_rejects_budget_below_one_block_with_rank(monkeypatch):
+    module = load_model_runner(monkeypatch)
+    runner = module.ModelRunner.__new__(module.ModelRunner)
+    runner.config = {
+        "num_layers": 2,
+        "num_kv_heads": 2,
+        "head_dim": 4,
+        "gpu_memory_utilization": 0.5,
+    }
+    runner.rank = 7
+    runner.block_size = 2
+    runner.default_dtype = torch.float32
+
+    monkeypatch.setattr(module.torch.mps, "synchronize", lambda: None)
+    monkeypatch.setattr(module.torch.mps, "recommended_max_memory", lambda: 512)
+    monkeypatch.setattr(module.torch.mps, "driver_allocated_memory", lambda: 128)
+
+    with pytest.raises(AssertionError, match="at least one block.*rank 7"):
+        runner.allocate_kv_cache()
+
+
+def test_allocate_kv_cache_infers_head_dim_from_hidden_size(monkeypatch):
+    module = load_model_runner(monkeypatch)
+    runner = module.ModelRunner.__new__(module.ModelRunner)
+    runner.config = {
+        "num_layers": 1,
+        "num_kv_heads": 1,
+        "hidden_size": 12,
+        "num_heads": 3,
+        "gpu_memory_utilization": 1.0,
+    }
+    runner.rank = 0
+    runner.block_size = 2
+    runner.default_dtype = torch.float32
+    runner.device = torch.device("cpu")
+    layer = CacheLayer()
+    runner.model = CacheModel([layer])
+
+    monkeypatch.setattr(module.torch.mps, "synchronize", lambda: None)
+    monkeypatch.setattr(module.torch.mps, "recommended_max_memory", lambda: 192)
+    monkeypatch.setattr(module.torch.mps, "driver_allocated_memory", lambda: 0)
+
+    runner.allocate_kv_cache()
+
+    assert runner.config["max_cached_blocks"] == 3
+    assert layer.k_cache.shape == (3, 2, 1, 4)
+    assert layer.v_cache.shape == (3, 2, 1, 4)
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")
