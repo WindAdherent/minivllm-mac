@@ -29,6 +29,14 @@ class DummyModel(torch.nn.Module):
         return hidden_states
 
 
+class EagerModel:
+    def __call__(self, input_ids):
+        return input_ids.float() + 1
+
+    def compute_logits(self, hidden_states):
+        return hidden_states * 2
+
+
 class DummySampler(torch.nn.Module):
     def forward(self, logits, temperature=None):
         return logits.argmax(dim=-1).tolist()
@@ -205,6 +213,45 @@ def test_constructor_uses_gloo_and_moves_model_to_mps(monkeypatch):
     assert runner.model.moved_to == torch.device("mps")
     assert init_calls == [("gloo", "tcp://localhost:12345", 1, 0)]
     assert default_devices == [torch.device("mps")]
+
+
+@pytest.mark.parametrize("is_prefill", [True, False])
+def test_run_model_is_eager_for_prefill_and_decode(monkeypatch, is_prefill):
+    module = load_model_runner(monkeypatch)
+    runner = module.ModelRunner.__new__(module.ModelRunner)
+    runner.model = EagerModel()
+    runner.enforce_eager = False
+    input_ids = torch.tensor([1, 3])
+
+    logits = runner.run_model(input_ids, is_prefill)
+
+    torch.testing.assert_close(logits, torch.tensor([4.0, 8.0]))
+
+
+def test_exit_synchronizes_mps_and_destroys_process_group(monkeypatch):
+    module = load_model_runner(monkeypatch)
+    runner = module.ModelRunner.__new__(module.ModelRunner)
+    runner.world_size = 1
+    runner.enforce_eager = True
+    calls = []
+
+    monkeypatch.setattr(module.torch.mps, "synchronize", lambda: calls.append("sync"))
+    monkeypatch.setattr(module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        module.dist, "destroy_process_group", lambda: calls.append("destroy")
+    )
+
+    runner.exit()
+
+    assert calls == ["sync", "destroy"]
+
+
+def test_model_runner_source_has_no_cuda_or_nccl_execution():
+    source = MODEL_RUNNER_PATH.read_text().lower()
+
+    forbidden = ["torch.cuda", ".cuda(", "cuda:", "cudagraph", "nccl"]
+
+    assert not [term for term in forbidden if term in source]
 
 
 def test_warmup_uses_mps_cache_and_synchronization(monkeypatch):

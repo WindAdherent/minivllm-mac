@@ -1,4 +1,3 @@
-import math
 import torch
 import pickle
 import torch.distributed as dist
@@ -79,16 +78,13 @@ class ModelRunner:
             case _:
                 raise Exception(f"Unsupported model: {config['model_name_or_path']}")
 
-        # Load weights in GPU (model moved to GPU before loading weights)
+        # Move the model to its execution device before loading weights.
         self.model = self.model.to(self.device)
 
         # Load pretrained weights if model_name_or_path is provided
         if config.get('model_name_or_path'):
             from myvllm.utils.loader import load_weights_from_checkpoint
             load_weights_from_checkpoint(self.model, config['model_name_or_path'])
-
-        # Load weights in CPU (move the model to GPU after loading weights)
-        # self.model = self.model.cuda(rank)
 
         self.sampler = SamplerLayer()
 
@@ -102,9 +98,6 @@ class ModelRunner:
         self.warmup_model()
         # allocate kv cache
         self.allocate_kv_cache()
-        # capture cuda graph for decoding
-        if not self.enforce_eager:
-            self.capture_cudagraph()
 
         torch.set_default_device(self.device)
         torch.set_default_dtype(self.default_dtype)
@@ -153,16 +146,13 @@ class ModelRunner:
         for event in self.event:
             event.set()
 
-    # close shared memory, destroy process group, delete graphs
+    # close shared memory and destroy the process group
     def exit(self):
         if self.world_size > 1:
             self.shm.close()
             if self.rank == 0:
                 self.shm.unlink()
-        if not self.enforce_eager:
-            del self.graphs
-            del self.graph_vars
-        torch.cuda.synchronize()
+        torch.mps.synchronize()
         # Check if process group exists before destroying
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -338,36 +328,10 @@ class ModelRunner:
     def prepare_sample(self, seqs: list[Sequence]) -> torch.Tensor:
         return torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, device=self.device)
 
-    # when prefilling, directly compute model forward + logits
-    # when decoding, use cuda graph execution to speed up
-    # allocate input_ids, positions, slot_mapping, context_lens, block_tables, outputs
-    # into graph_variable, and then replay the graph
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, is_prefill: bool) -> torch.Tensor:
-        if is_prefill or self.enforce_eager:
-            # For varlen prefill, keep input_ids as 1D (concatenated tokens)
-            # Do NOT unsqueeze - flash_attn_varlen_func expects 1D input with cu_seqlens
-            hidden_states = self.model(input_ids)
-            logits = self.model.compute_logits(hidden_states)
-        else:
-            bs = input_ids.size(0)
-            context = get_context()
-
-            # finds smallest captured graph that fits the batch size
-            graph = self.graphs[next(bs_ for bs_ in self.graphs.keys() if bs_ >= bs)]
-            vars = self.graph_vars
-            # copy input data into graph variables
-            vars['input_ids'][:bs].copy_(input_ids)
-            vars['slot_mapping'][:bs].fill_(-1)
-            vars['slot_mapping'][:bs].copy_(context.slot_mapping)
-            vars["context_lens"].zero_()
-            vars['context_lens'][:bs].copy_(context.context_lens)
-            vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            # replay the graph
-            graph.replay()
-            logits = self.model.compute_logits(vars['outputs'][:bs])
-
-        return logits
+        hidden_states = self.model(input_ids)
+        return self.model.compute_logits(hidden_states)
 
 
     # prepare prefill
@@ -387,64 +351,3 @@ class ModelRunner:
             token_ids = self.sampler(logits, self.prepare_sample(seqs))
         reset_context()
         return token_ids
-
-    # capture the CUDA graph:
-    # pre-allocation at maximum sizes: allocated onece and reuse for all graphs
-    # capture for different common batch sizes: [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-    # with torch.cuda.graph(graph, self.graph_pool):
-    #        run model() and exact sequence of CUDA kernels for running self.model() will be captured
-    # (later use graph.replay() to run the captured graph)
-    @torch.inference_mode()
-    def capture_cudagraph(self) -> None:
-        max_bs = self.config['max_num_seqs']
-        max_len = self.config['max_model_length']
-        max_num_blocks = math.ceil(max_len / self.block_size)
-        # for decoding, input is always of shape (batch_size, 1)
-        input_ids = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
-        # for paged attention
-        # where to write new KV values in the cache
-        slot_mapping = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
-        # how many tokens each sequence has processed
-        context_lens = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
-        # where to read KV values in the cache
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{self.rank}')
-        # output logits
-        outputs = torch.zeros(max_bs, self.config['vocab_size'], device=f'cuda:{self.rank}')
-
-        # graphs to be captured for different batch sizes
-        batch_sizes = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-        self.graphs = {}
-        graph_pool = None
-
-        for batch_size in reversed(batch_sizes):
-            graph = torch.cuda.CUDAGraph()
-            set_context(
-                is_prefill=False,
-                cu_seqlens_q=None,
-                cu_seqlens_k=None,
-                max_seqlen_q=0,
-                max_seqlen_k=0,
-                slot_mapping=slot_mapping[:batch_size],
-                context_lens=context_lens[:batch_size],
-                block_tables=block_tables[:batch_size],
-            )
-            outputs[:batch_size] = self.model(input_ids[:batch_size])
-
-            with torch.cuda.graph(graph, graph_pool):
-                outputs[:batch_size] = self.model(input_ids[:batch_size])
-                if graph_pool is None:
-                    graph_pool = graph.pool()
-            # store the captured graph
-            self.graphs[batch_size] = graph
-
-            # make sure that the capture is done before resetting and next capture
-            torch.cuda.synchronize()
-            reset_context()
-
-        self.graph_vars = dict(
-            input_ids=input_ids,
-            slot_mapping=slot_mapping,
-            context_lens=context_lens,
-            block_tables=block_tables,
-            outputs=outputs,
-        )
