@@ -20,7 +20,7 @@
 
 ## Execution status — implementation verified 2026-07-14
 
-Implementation and task-level reviews are complete in the isolated worktree at `/Users/chowhound/VSCodeProjects/minivllm-mac/.worktrees/model-runner-mps` on branch `feat/model-runner-mps`:
+Tasks 1–4 and their reviews are complete; Task 5 verification is complete; final whole-feature review and integration remain pending. Work remains in the isolated worktree at `/Users/chowhound/VSCodeProjects/minivllm-mac/.worktrees/model-runner-mps` on branch `feat/model-runner-mps`:
 
 - Task 1 is complete and reviewed at `0278337`.
   - Runtime validation, single-rank Gloo initialization, and MPS model/default-device placement are retained.
@@ -32,10 +32,12 @@ Implementation and task-level reviews are complete in the isolated worktree at `
 - Task 4 is complete and reviewed at `5c82183`.
   - Decode runs eagerly on MPS and the remaining graph-capture lifecycle was removed without changing sampling or context-reset behavior.
 - Task 5 fresh verification completed on 2026-07-14:
-  - `/Users/chowhound/VSCodeProjects/minivllm-mac/.venv/bin/python -m pytest -q` exited 0 with `23 passed in 2.02s`, zero failures, and no MPS skips.
+  - `/Users/chowhound/VSCodeProjects/minivllm-mac/.venv/bin/python -m pytest -q` ran with host Metal/MPS access and exited 0 with `23 passed in 2.02s`, zero failures, and no MPS skips. The restricted sandbox can skip MPS tests, so this result specifically records the host-access run.
   - `/Users/chowhound/VSCodeProjects/minivllm-mac/.venv/bin/python -m py_compile src/myvllm/engine/model_runner.py tests/test_model_runner.py` exited 0 with no output.
   - Case-insensitive `cuda|nccl` and graph-state scans (`capture|replay|graph_pool|graph_vars|self\.graphs`) each exited 1 with no matches in `model_runner.py`.
-  - `git diff --check` exited 0, and `git status --short` was clean before this status update.
+  - `git diff --check 5c82183..e50db44` exited 0 with no output for the Task 5 documentation-only range.
+  - `git diff --check d94844c..e50db44` exited 2 and reported six inherited trailing-whitespace findings in the copied user-owned `model_runner.py`, at current lines 159, 208, 239, 302, 303, and 325. These findings predate and are outside the CUDA-to-MPS behavior edits, but remain visible in the whole-feature range because the tracked base runner was empty; the whole-feature range is therefore not formatting-clean, and this documentation-only update does not normalize that source.
+  - `git status --short` was clean before this status update.
   - Relative to `d94844c`, the feature changes are limited to `src/myvllm/engine/model_runner.py`, `tests/test_model_runner.py`, and this implementation plan; no file outside the allowed runner, tests, design-spec, and implementation-plan scope changed.
   - The main worktree's pre-existing modification to `src/myvllm/engine/model_runner.py` is user-owned and was not changed while executing the feature worktree.
 
@@ -47,7 +49,7 @@ Final whole-feature review remains next. The branch has not been integrated or m
 - Create: `tests/test_model_runner.py`
 - Modify: `src/myvllm/engine/model_runner.py:1-102`
 
-- [ ] **Step 1: Create an isolated module loader and write failing runtime-validation tests**
+- [x] **Step 1: Create an isolated module loader and write failing runtime-validation tests**
 
 Create `tests/test_model_runner.py` with stubs for currently incomplete neighboring modules. This keeps the tests scoped to `model_runner.py` rather than requiring unrelated sampler, Llama, or checkpoint-loader implementation.
 
@@ -152,7 +154,7 @@ def test_mps_device_rejects_unsupported_runtime(monkeypatch):
         module._mps_device(world_size=1, rank=0)
 ```
 
-- [ ] **Step 2: Run the validation test and verify RED**
+- [x] **Step 2: Run the validation test and verify RED**
 
 Run:
 
@@ -162,7 +164,7 @@ uv run --no-sync pytest tests/test_model_runner.py::test_mps_device_rejects_unsu
 
 Expected: FAIL with `AttributeError: module 'model_runner_under_test' has no attribute '_mps_device'`.
 
-- [ ] **Step 3: Add the minimal MPS runtime helper**
+- [x] **Step 3: Add the minimal MPS runtime helper**
 
 Add below the imports in `model_runner.py`:
 
@@ -177,11 +179,11 @@ def _mps_device(world_size: int, rank: int) -> torch.device:
     return torch.device("mps")
 ```
 
-- [ ] **Step 4: Run the validation test and verify GREEN**
+- [x] **Step 4: Run the validation test and verify GREEN**
 
 Run the command from Step 2. Expected: PASS.
 
-- [ ] **Step 5: Write a failing constructor-placement test**
+- [x] **Step 5: Write a failing constructor-placement test**
 
 Append:
 
@@ -234,7 +236,7 @@ def test_constructor_uses_gloo_and_moves_model_to_mps(monkeypatch):
     assert default_devices == [torch.device("mps")]
 ```
 
-- [ ] **Step 6: Run the constructor test and verify RED**
+- [x] **Step 6: Run the constructor test and verify RED**
 
 Run:
 
@@ -244,7 +246,7 @@ uv run --no-sync pytest tests/test_model_runner.py::test_constructor_uses_gloo_a
 
 Expected: FAIL because construction still initializes NCCL or calls a CUDA device API.
 
-- [ ] **Step 7: Switch initialization and model placement to MPS**
+- [x] **Step 7: Switch initialization and model placement to MPS**
 
 In `ModelRunner.__init__`, retain the existing assignments and model-selection match, but replace the rank/process/device setup and model move with:
 
@@ -272,7 +274,7 @@ torch.set_default_dtype(self.default_dtype)
 
 Leave graph-capture removal for Task 4 so its regression test can be observed failing first.
 
-- [ ] **Step 8: Run Task 1 tests and verify GREEN**
+- [x] **Step 8: Run Task 1 tests and verify GREEN**
 
 Run:
 
@@ -282,7 +284,7 @@ uv run --no-sync pytest tests/test_model_runner.py -k "mps_device or constructor
 
 Expected: 2 passed.
 
-- [ ] **Step 9: Commit Task 1**
+- [x] **Step 9: Commit Task 1**
 
 ```bash
 git add tests/test_model_runner.py
@@ -298,7 +300,7 @@ Before staging, verify `git diff -- src/myvllm/engine/model_runner.py` still con
 - Modify: `tests/test_model_runner.py`
 - Modify: `src/myvllm/engine/model_runner.py:260-347`
 
-- [ ] **Step 1: Add a reusable fake sequence and a failing prefill test**
+- [x] **Step 1: Add a reusable fake sequence and a failing prefill test**
 
 Append:
 
@@ -358,7 +360,7 @@ def test_prepare_prefill_builds_mps_context(monkeypatch):
     assert context.block_tables is None
 ```
 
-- [ ] **Step 2: Run the prefill test and verify RED**
+- [x] **Step 2: Run the prefill test and verify RED**
 
 Run:
 
@@ -368,7 +370,7 @@ uv run --no-sync pytest tests/test_model_runner.py::test_prepare_prefill_builds_
 
 Expected: FAIL when the existing `.cuda(non_blocking=True)` path runs on the Mac.
 
-- [ ] **Step 3: Move prefill tensors directly to the runner device**
+- [x] **Step 3: Move prefill tensors directly to the runner device**
 
 Replace the tensor-construction tail of `prepare_prefill` with:
 
@@ -399,11 +401,11 @@ set_context(
 return input_ids
 ```
 
-- [ ] **Step 4: Run the prefill test and verify GREEN**
+- [x] **Step 4: Run the prefill test and verify GREEN**
 
 Run the command from Step 2. Expected: PASS.
 
-- [ ] **Step 5: Add failing decode and sampling tests**
+- [x] **Step 5: Add failing decode and sampling tests**
 
 Append:
 
@@ -437,7 +439,7 @@ def test_prepare_decode_and_sample_build_mps_tensors(monkeypatch):
     )
 ```
 
-- [ ] **Step 6: Run the decode test and verify RED**
+- [x] **Step 6: Run the decode test and verify RED**
 
 Run:
 
@@ -447,7 +449,7 @@ uv run --no-sync pytest tests/test_model_runner.py::test_prepare_decode_and_samp
 
 Expected: FAIL when a CUDA tensor transfer is attempted.
 
-- [ ] **Step 7: Move decode and sampling tensors directly to MPS**
+- [x] **Step 7: Move decode and sampling tensors directly to MPS**
 
 In `prepare_decode`, replace every pinned CPU tensor plus `.cuda(non_blocking=True)` construction with direct `device=self.device` construction:
 
@@ -485,7 +487,7 @@ def prepare_sample(self, seqs: list[Sequence]) -> torch.Tensor:
     )
 ```
 
-- [ ] **Step 8: Run Task 2 tests and verify GREEN**
+- [x] **Step 8: Run Task 2 tests and verify GREEN**
 
 Run:
 
@@ -495,7 +497,7 @@ uv run --no-sync pytest tests/test_model_runner.py -k "prepare_prefill or prepar
 
 Expected: 2 passed.
 
-- [ ] **Step 9: Commit Task 2**
+- [x] **Step 9: Commit Task 2**
 
 ```bash
 git add tests/test_model_runner.py
@@ -509,7 +511,7 @@ git commit -m "feat: prepare inference tensors on MPS"
 - Modify: `tests/test_model_runner.py`
 - Modify: `src/myvllm/engine/model_runner.py:178-253`
 
-- [ ] **Step 1: Write a failing warmup synchronization test**
+- [x] **Step 1: Write a failing warmup synchronization test**
 
 Append:
 
@@ -533,7 +535,7 @@ def test_warmup_uses_mps_cache_and_synchronization(monkeypatch):
     assert calls == ["empty", (2, True), "sync", "empty"]
 ```
 
-- [ ] **Step 2: Run the warmup test and verify RED**
+- [x] **Step 2: Run the warmup test and verify RED**
 
 Run:
 
@@ -543,7 +545,7 @@ uv run --no-sync pytest tests/test_model_runner.py::test_warmup_uses_mps_cache_a
 
 Expected: FAIL because `warmup_model` calls CUDA memory APIs.
 
-- [ ] **Step 3: Implement MPS warmup synchronization**
+- [x] **Step 3: Implement MPS warmup synchronization**
 
 Replace `warmup_model` with:
 
@@ -565,11 +567,11 @@ def warmup_model(self):
     torch.mps.empty_cache()
 ```
 
-- [ ] **Step 4: Run the warmup test and verify GREEN**
+- [x] **Step 4: Run the warmup test and verify GREEN**
 
 Run the command from Step 2. Expected: PASS.
 
-- [ ] **Step 5: Write a failing deterministic cache-budget test**
+- [x] **Step 5: Write a failing deterministic cache-budget test**
 
 Append:
 
@@ -623,7 +625,7 @@ def test_allocate_kv_cache_uses_mps_working_set_budget(monkeypatch):
 
 The expected block count follows `(1024 * 0.5 - 128) // 256 == 1`, where one block consumes `2 * 2 * 2 * 2 * 4 * 4 == 256` bytes.
 
-- [ ] **Step 6: Run the cache-budget test and verify RED**
+- [x] **Step 6: Run the cache-budget test and verify RED**
 
 Run:
 
@@ -633,7 +635,7 @@ uv run --no-sync pytest tests/test_model_runner.py::test_allocate_kv_cache_uses_
 
 Expected: FAIL when `torch.cuda.mem_get_info()` is reached.
 
-- [ ] **Step 7: Implement MPS cache budgeting and allocation**
+- [x] **Step 7: Implement MPS cache budgeting and allocation**
 
 Replace the memory-query and distributed-reduction portions of `allocate_kv_cache` with:
 
@@ -684,7 +686,7 @@ allocated_kv_cache = torch.zeros(
 
 Retain the existing loop that assigns per-layer `k_cache` and `v_cache` views. Remove the cross-rank reduction because the validated runtime has one rank.
 
-- [ ] **Step 8: Run Task 3 tests and verify GREEN**
+- [x] **Step 8: Run Task 3 tests and verify GREEN**
 
 Run:
 
@@ -694,7 +696,7 @@ uv run --no-sync pytest tests/test_model_runner.py -k "warmup or allocate_kv_cac
 
 Expected: 2 passed.
 
-- [ ] **Step 9: Commit Task 3**
+- [x] **Step 9: Commit Task 3**
 
 ```bash
 git add tests/test_model_runner.py
@@ -708,7 +710,7 @@ git commit -m "feat: size KV cache for MPS memory"
 - Modify: `tests/test_model_runner.py`
 - Modify: `src/myvllm/engine/model_runner.py:145-458`
 
-- [ ] **Step 1: Write a failing eager-decode regression test**
+- [x] **Step 1: Write a failing eager-decode regression test**
 
 Append:
 
@@ -734,7 +736,7 @@ def test_run_model_is_eager_for_prefill_and_decode(monkeypatch, is_prefill):
     torch.testing.assert_close(logits, torch.tensor([4.0, 8.0]))
 ```
 
-- [ ] **Step 2: Run the decode parameter and verify RED**
+- [x] **Step 2: Run the decode parameter and verify RED**
 
 Run:
 
@@ -744,7 +746,7 @@ uv run --no-sync pytest 'tests/test_model_runner.py::test_run_model_is_eager_for
 
 Expected: FAIL with a missing `graphs` or `graph_vars` attribute, proving decode still requires CUDA Graph state.
 
-- [ ] **Step 3: Make both model paths eager**
+- [x] **Step 3: Make both model paths eager**
 
 Replace `run_model` with:
 
@@ -759,7 +761,7 @@ def run_model(
 
 Keep `is_prefill` in the signature for caller compatibility even though MPS uses the same eager path for both values.
 
-- [ ] **Step 4: Run the eager test and verify GREEN**
+- [x] **Step 4: Run the eager test and verify GREEN**
 
 Run:
 
@@ -769,7 +771,7 @@ uv run --no-sync pytest tests/test_model_runner.py::test_run_model_is_eager_for_
 
 Expected: 2 passed.
 
-- [ ] **Step 5: Write failing cleanup and source-scan tests**
+- [x] **Step 5: Write failing cleanup and source-scan tests**
 
 Append:
 
@@ -800,7 +802,7 @@ def test_model_runner_source_has_no_cuda_or_nccl_execution():
         assert token not in source
 ```
 
-- [ ] **Step 6: Run cleanup and source scan and verify RED**
+- [x] **Step 6: Run cleanup and source scan and verify RED**
 
 Run:
 
@@ -810,7 +812,7 @@ uv run --no-sync pytest tests/test_model_runner.py -k "exit_synchronizes or no_c
 
 Expected: both tests FAIL because cleanup and graph capture still use CUDA.
 
-- [ ] **Step 7: Remove CUDA graph initialization, capture, and cleanup**
+- [x] **Step 7: Remove CUDA graph initialization, capture, and cleanup**
 
 Make these focused production edits:
 
@@ -827,7 +829,7 @@ torch.mps.synchronize()
 
 Delete the complete `capture_cudagraph` method, including graph buffers, graph pools, replay capture, and CUDA synchronization. Update nearby comments to describe eager MPS execution and remove obsolete CUDA wording. Do not change `run`, shared-memory methods, sampling conditions, or context reset.
 
-- [ ] **Step 8: Run all focused tests and verify GREEN**
+- [x] **Step 8: Run all focused tests and verify GREEN**
 
 Run:
 
@@ -837,7 +839,7 @@ uv run --no-sync pytest tests/test_model_runner.py -v
 
 Expected: all model-runner tests pass with no failures or warnings from the changed code.
 
-- [ ] **Step 9: Commit Task 4**
+- [x] **Step 9: Commit Task 4**
 
 ```bash
 git add tests/test_model_runner.py
@@ -852,7 +854,7 @@ git commit -m "feat: run model decode eagerly on MPS"
 - Modify only if verification exposes a scoped defect: `src/myvllm/engine/model_runner.py`
 - Modify: `docs/superpowers/plans/2026-07-13-model-runner-mps.md`
 
-- [ ] **Step 1: Run the complete project test suite with Metal access**
+- [x] **Step 1: Run the complete project test suite with Metal access**
 
 Run:
 
@@ -862,7 +864,7 @@ uv run --no-sync pytest -q
 
 Expected: all tests pass; MPS tests execute on the target Mac rather than being skipped.
 
-- [ ] **Step 2: Compile the changed Python files**
+- [x] **Step 2: Compile the changed Python files**
 
 Run:
 
@@ -872,7 +874,7 @@ uv run --no-sync python -m py_compile src/myvllm/engine/model_runner.py tests/te
 
 Expected: exit code 0 and no output.
 
-- [ ] **Step 3: Scan the requested source file for stale CUDA/NCCL content**
+- [x] **Step 3: Scan the requested source file for stale CUDA/NCCL content**
 
 Run:
 
@@ -882,7 +884,7 @@ rg -n -i "cuda|nccl" src/myvllm/engine/model_runner.py
 
 Expected: exit code 1 with no matches.
 
-- [ ] **Step 4: Review formatting and scope**
+- [x] **Step 4: Review formatting and scope**
 
 Run:
 
@@ -892,9 +894,9 @@ git status --short
 git diff -- src/myvllm/engine/model_runner.py tests/test_model_runner.py
 ```
 
-Expected: no whitespace errors; only the requested model runner, its focused tests, and plan progress are part of this implementation. Confirm the final `model_runner.py` still contains the original model constructors, checkpoint loader call, shared-memory protocol, sequence preparation logic, sampler call, and context reset.
+Recorded result: the Task 5 documentation-only range `5c82183..e50db44` has no whitespace errors. The whole-feature range `d94844c..e50db44` reports the six inherited copied-source findings documented in the execution status above. Only the requested model runner, its focused tests, and plan progress are part of this implementation. The final `model_runner.py` retains the original model constructors, checkpoint loader call, shared-memory protocol, sequence preparation logic, sampler call, and context reset.
 
-- [ ] **Step 5: Commit final plan progress only if it changed after Task 4**
+- [x] **Step 5: Commit final plan progress only if it changed after Task 4**
 
 ```bash
 git add docs/superpowers/plans/2026-07-13-model-runner-mps.md
